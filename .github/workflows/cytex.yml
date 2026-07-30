@@ -83,13 +83,11 @@ jobs:
 
       # Each scanner records its exit code instead of failing the job: one broken tool must
       # not discard the results of the others. Failures surface in the consolidated report.
-      # tee keeps the CycloneDX SBOM (components + metadata) on stdout for the platform's
-      # log scraper (-> github_aibom) while capturing it to a file for the report.
       - name: Generate SBOM (Syft)
         run: |
           set +e
-          syft "dir:$SCAN_DIR" -o cyclonedx-json | tee "$REPORT_DIR/sbom.cdx.json"
-          echo "SYFT_STATUS=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+          syft "dir:$SCAN_DIR" -o cyclonedx-json > "$REPORT_DIR/sbom.cdx.json"
+          echo "SYFT_STATUS=$?" >> "$GITHUB_ENV"
 
       # Grype emits JSON to stdout for the platform's log scraper and CycloneDX to a file
       # for the consolidated report.
