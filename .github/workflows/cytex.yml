@@ -359,6 +359,55 @@ jobs:
               },
           }
 
+          # Skill risk: a 0-100 score and a level per skill (see aibom/devops/skill_risk.py).
+          SKILL_RISK_POINTS = {"critical": 40, "high": 20, "medium": 8, "low": 3}
+          SKILL_RISK_LEVELS = ["none", "low", "medium", "high", "critical"]
+          SKILL_RISK_FLOORS = {"critical": 70, "high": 40, "medium": 15, "low": 1, "none": 0}
+          SKILL_RISK_DANGEROUS = ("exfil", "inject", "exec", "command", "shell", "credential", "secret",
+                                  "obfusc", "poison", "privilege", "escalat", "backdoor", "malware")
+          skill_findings = {}
+          for vuln in combined.get("vulnerabilities") or []:
+              if isinstance(vuln, dict) and vuln.get("_source") == "skills":
+                  for affected in vuln.get("affects") or []:
+                      skill_findings.setdefault(affected.get("ref"), []).append(vuln)
+          skill_risk = []
+          for comp in combined.get("components") or []:
+              if not isinstance(comp, dict) or comp.get("_source") != "skills":
+                  continue
+              props = {p.get("name"): p.get("value") for p in comp.get("properties") or [] if isinstance(p, dict)}
+              score, worst, by_severity, risky = 0.0, "none", {}, set()
+              for vuln in skill_findings.get(comp.get("bom-ref"), []):
+                  severity = str(((vuln.get("ratings") or [{}])[0] or {}).get("severity", "")).lower()
+                  vuln_props = {p.get("name"): p.get("value") for p in vuln.get("properties") or [] if isinstance(p, dict)}
+                  category = str(vuln_props.get("skill:Category") or "").lower()
+                  weight = 1.5 if any(word in category for word in SKILL_RISK_DANGEROUS) else 1.0
+                  if weight > 1:
+                      risky.add(category)
+                  score += SKILL_RISK_POINTS.get(severity, 0) * weight
+                  by_severity[severity or "unknown"] = by_severity.get(severity or "unknown", 0) + 1
+                  if severity in SKILL_RISK_LEVELS and SKILL_RISK_LEVELS.index(severity) > SKILL_RISK_LEVELS.index(worst):
+                      worst = severity
+              score = min(100, int(round(score)))
+              level = next(name for name in reversed(SKILL_RISK_LEVELS) if score >= SKILL_RISK_FLOORS[name])
+              if SKILL_RISK_LEVELS.index(worst) > SKILL_RISK_LEVELS.index(level):
+                  level, score = worst, max(score, SKILL_RISK_FLOORS[worst])
+              if level == "none" and str(props.get("skill:IsSafe", "")).lower() == "false":
+                  level, score = "low", max(score, SKILL_RISK_FLOORS["low"])
+              comp.setdefault("properties", []).extend([
+                  {"name": "skill:RiskScore", "value": str(score)},
+                  {"name": "skill:RiskLevel", "value": level},
+                  {"name": "skill:RiskFactors", "value": ", ".join(sorted(risky))},
+              ])
+              skill_risk.append({"skill": comp.get("name", ""), "bom-ref": comp.get("bom-ref", ""),
+                                 "path": props.get("skill:Path", ""), "riskScore": score, "riskLevel": level,
+                                 "findingsBySeverity": by_severity, "riskFactors": sorted(risky)})
+          skill_risk.sort(key=lambda item: -item["riskScore"])
+          skill_levels = {}
+          for item in skill_risk:
+              skill_levels[item["riskLevel"]] = skill_levels.get(item["riskLevel"], 0) + 1
+          combined["skillRisk"] = {"skills": skill_risk, "levelCounts": skill_levels,
+                                   "highestLevel": skill_risk[0]["riskLevel"] if skill_risk else "none"}
+          combined["cytexScan"]["summary"]["skillRiskLevels"] = skill_levels
           combined = norm(combined)
           with open(os.path.join(report_dir, "cytex-scan-report.json"), "w") as fh:
               json.dump(combined, fh, indent=2, sort_keys=True)
