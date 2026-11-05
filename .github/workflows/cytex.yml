@@ -105,9 +105,13 @@ jobs:
         run: |
           set +e
           if [ -z "$AIBOM_LLM_API_KEY" ]; then
-            echo "No GROQ_API_KEY secret -- generating AIBOM without LLM enrichment"
+            echo "No GROQ_API_KEY secret -- rule-based AIBOM only (the LLM points at a dead local address, so no code leaves the runner)"
             timeout 600 cisco-aibom analyze "$SCAN_DIR" \
               -o cyclonedx -O "$REPORT_DIR/aibom.cdx.json" \
+              --llm-model "$AIBOM_LLM_MODEL" \
+              --llm-provider openai \
+              --llm-api-base http://127.0.0.1:9/v1 \
+              --llm-api-key no-key \
               --severity info \
               --compliance all \
               --timing \
