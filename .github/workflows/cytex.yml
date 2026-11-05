@@ -32,17 +32,24 @@ jobs:
         with:
           persist-credentials: false
 
+      # cisco-aibom needs Python >=3.11,<3.14; pin it instead of trusting the runner image
+      # (ubuntu-latest moved to 26.04 with Python 3.14, where pip finds no cisco-aibom).
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install scan toolchain
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/$GRYPE_VERSION/install.sh | sh -s -- -b /usr/local/bin $GRYPE_VERSION
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/$SYFT_VERSION/install.sh | sh -s -- -b /usr/local/bin $SYFT_VERSION
+          for i in 1 2 3 4 5; do curl -sSfL --retry 3 --retry-delay 5 -o /tmp/grype-install.sh https://raw.githubusercontent.com/anchore/grype/$GRYPE_VERSION/install.sh && sh /tmp/grype-install.sh -b /usr/local/bin $GRYPE_VERSION && break; echo "grype install failed (attempt $i/5)"; sleep $((i * 15)); done
+          for i in 1 2 3 4 5; do curl -sSfL --retry 3 --retry-delay 5 -o /tmp/syft-install.sh https://raw.githubusercontent.com/anchore/syft/$SYFT_VERSION/install.sh && sh /tmp/syft-install.sh -b /usr/local/bin $SYFT_VERSION && break; echo "syft install failed (attempt $i/5)"; sleep $((i * 15)); done
           # cisco-aibom[all] also installs skill-scanner (via its "security" extra).
           python3 -m pip install --quiet --pre "cisco-aibom[all]==$AIBOM_VERSION" langchain-groq
           # semgrep and mcp-scanner run from isolated pipx environments.
           pipx install --force semgrep
           pipx install --force cisco-ai-mcp-scanner
           mkdir -p ~/.aibom/catalogs
-          curl -sSfL -o ~/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb https://github.com/cisco-ai-defense/aibom/releases/download/$AIBOM_VERSION/aibom_catalog-$AIBOM_VERSION.duckdb
+          curl -sSfL --retry 5 --retry-delay 10 -o ~/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb https://github.com/cisco-ai-defense/aibom/releases/download/$AIBOM_VERSION/aibom_catalog-$AIBOM_VERSION.duckdb
           echo "$AIBOM_CATALOG_SHA256  $HOME/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb" | sha256sum -c -
 
       - name: Resolve scan scope
