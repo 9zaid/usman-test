@@ -10,6 +10,9 @@ on:
         required: false
         default: ""
 
+permissions:
+  contents: read
+
 jobs:
   scan:
     name: Cytex security scan
@@ -21,14 +24,19 @@ jobs:
       AIBOM_LLM_PROVIDER: groq
       AIBOM_LLM_MODEL: openai/gpt-oss-120b
       AIBOM_FAST_MODEL: openai/gpt-oss-20b
+      GRYPE_VERSION: v0.112.0
+      SYFT_VERSION: v1.50.0
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install scan toolchain
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/$GRYPE_VERSION/install.sh | sh -s -- -b /usr/local/bin $GRYPE_VERSION
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/$SYFT_VERSION/install.sh | sh -s -- -b /usr/local/bin $SYFT_VERSION
+          # cisco-aibom[all] also installs skill-scanner (via its "security" extra).
           python3 -m pip install --quiet --pre "cisco-aibom[all]==$AIBOM_VERSION" langchain-groq
           # semgrep and mcp-scanner run from isolated pipx environments.
           pipx install --force semgrep
@@ -89,20 +97,31 @@ jobs:
           AIBOM_LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           set +e
-          timeout 600 cisco-aibom analyze "$SCAN_DIR" \
-            -o cyclonedx -O "$REPORT_DIR/aibom.cdx.json" \
-            --llm-model "$AIBOM_LLM_MODEL" \
-            --llm-provider "$AIBOM_LLM_PROVIDER" \
-            --llm-api-key "$AIBOM_LLM_API_KEY" \
-            --agentic-fast-model "$AIBOM_FAST_MODEL" \
-            --severity info \
-            --agentic-batch-size 3 \
-            --agentic-concurrency 1 \
-            --agentic-timeout 120 \
-            --compliance all \
-            --timing \
-            --validate \
-            --show-summary 2>&1 | tee "$REPORT_DIR/aibom_console.txt"
+          if [ -z "$AIBOM_LLM_API_KEY" ]; then
+            echo "No GROQ_API_KEY secret -- generating AIBOM without LLM enrichment"
+            timeout 600 cisco-aibom analyze "$SCAN_DIR" \
+              -o cyclonedx -O "$REPORT_DIR/aibom.cdx.json" \
+              --severity info \
+              --compliance all \
+              --timing \
+              --validate \
+              --show-summary 2>&1 | tee "$REPORT_DIR/aibom_console.txt"
+          else
+            timeout 600 cisco-aibom analyze "$SCAN_DIR" \
+              -o cyclonedx -O "$REPORT_DIR/aibom.cdx.json" \
+              --llm-model "$AIBOM_LLM_MODEL" \
+              --llm-provider "$AIBOM_LLM_PROVIDER" \
+              --llm-api-key "$AIBOM_LLM_API_KEY" \
+              --agentic-fast-model "$AIBOM_FAST_MODEL" \
+              --severity info \
+              --agentic-batch-size 3 \
+              --agentic-concurrency 1 \
+              --agentic-timeout 120 \
+              --compliance all \
+              --timing \
+              --validate \
+              --show-summary 2>&1 | tee "$REPORT_DIR/aibom_console.txt"
+          fi
           echo "AIBOM_STATUS=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
 
       - name: Scan agent skills (skill-scanner)
