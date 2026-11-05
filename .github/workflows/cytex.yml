@@ -19,13 +19,21 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REPORT_DIR: /tmp/cytex-reports
-      AIBOM_VERSION: 1.0.0rc2
+      # 1.10.0 finds the most without an LLM (benchmarked against rc2, 1.0.9 and 1.10.1).
+      AIBOM_VERSION: 1.10.0
       AIBOM_CATALOG_SHA256: b1165384a646094aa6a4762d676f285c1c68b6d7f9367c90a129b529904a3268
-      AIBOM_LLM_PROVIDER: groq
-      AIBOM_LLM_MODEL: openai/gpt-oss-120b
-      AIBOM_FAST_MODEL: openai/gpt-oss-20b
+      # Groq through its OpenAI-compatible endpoint: langchain-groq sends JSON mode together
+      # with tool calling, which Groq rejects (400), so every LLM batch failed. cisco-aibom
+      # strips a leading "openai/" when the provider is openai, hence the doubled prefix:
+      # Groq receives "openai/gpt-oss-120b".
+      AIBOM_LLM_PROVIDER: openai
+      AIBOM_LLM_API_BASE: https://api.groq.com/openai/v1
+      AIBOM_LLM_MODEL: openai/openai/gpt-oss-120b
+      AIBOM_FAST_MODEL: openai/openai/gpt-oss-20b
       GRYPE_VERSION: v0.112.0
       SYFT_VERSION: v1.50.0
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -51,7 +59,1271 @@ jobs:
           mkdir -p ~/.aibom/catalogs
           curl -sSfL --retry 5 --retry-delay 10 -o ~/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb https://github.com/cisco-ai-defense/aibom/releases/download/$AIBOM_VERSION/aibom_catalog-$AIBOM_VERSION.duckdb
           echo "$AIBOM_CATALOG_SHA256  $HOME/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb" | sha256sum -c -
+          for i in 1 2 3 4 5; do curl -sSfL --retry 3 --retry-delay 5 -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz && echo "$GITLEAKS_SHA256  /tmp/gitleaks.tar.gz" | sha256sum -c - && tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks && break; echo "gitleaks install failed (attempt $i/5)"; sleep $((i * 15)); done
 
+      # Helpers for the consolidate step (generated from scripts/github/*.py and *.toml).
+      - name: Prepare Cytex helpers
+        run: |
+          mkdir -p /tmp/cytex-tools
+          cat > /tmp/cytex-tools/aibom_refine.py <<'CYTEX_AIBOM_REFINE_PY_EOF'
+          """Deterministic (no-LLM) post-processing for cisco-aibom CycloneDX AIBOMs.
+
+          Entry point::
+
+              refined, suppressed = refine_aibom(aibom, repo_root=None, changed_files=None)
+
+          * Agent precision: drops data/ORM/DTO/CRUD/stats/logger classes reported as
+            agents, verifies framework attributions against the source when possible,
+            and tags every kept agent with a ``cytex:confidence`` property.
+          * Env endpoint/model precision: keeps env-based endpoints that point at an
+            AI/LLM/MCP provider, drops storage/db/generic-service ones.  Secret values
+            are never returned: only the hostname of an env value is parsed in memory
+            and compared against provider lists.
+          * De-duplication with bom-ref remapping, dangling-reference clean-up in
+            ``dependencies`` and ``vulnerabilities[].affects``.
+          * Incremental mode (``changed_files``): report only findings located in the
+            changed files (plus dependency components whose manifest changed).
+
+          Every removed component is returned in ``suppressed`` as
+          ``{"name", "type", "file", "line", "reason"}``; ``reason`` starts with
+          ``false-positive:``, ``duplicate:`` or ``out-of-scope:``.
+
+          Pure stdlib, Python 3.10+.  The input dict is not mutated.
+          """
+          from __future__ import annotations
+
+          import copy
+          import os
+          import re
+          from urllib.parse import urlparse
+
+          __all__ = ["refine_aibom"]
+
+          P_FILE = "cisco-aibom:file"
+          P_LINE = "cisco-aibom:line"
+          P_TYPE = "cisco-aibom:type"
+          P_FW = "cisco-aibom:framework"
+          P_CONF = "cytex:confidence"
+          P_EVID = "cytex:evidence"
+          P_RELFILE = "cytex:file"
+          P_EXTRA_LINES = "cytex:additionalLines"
+
+          # --------------------------------------------------------------------------
+          # Knowledge tables
+          # --------------------------------------------------------------------------
+
+          # Python modules / packages that are agent or LLM frameworks.
+          AI_FRAMEWORK_MODULES = (
+              "crewai", "langgraph", "langchain", "langchain_core", "langchain_community",
+              "langchain_openai", "langchain_anthropic", "langchain_groq", "langchain_mcp_adapters",
+              "autogen", "autogen_agentchat", "autogen_core", "ag2", "llama_index", "semantic_kernel",
+              "haystack", "smolagents", "pydantic_ai", "agents", "openai", "anthropic", "google.adk",
+              "google.generativeai", "google.genai", "vertexai", "agno", "phi", "dspy", "mcp", "fastmcp",
+              "litellm", "instructor", "groq", "mistralai", "cohere", "ollama", "transformers",
+              "camel", "swarm", "letta", "strands", "bedrock_agentcore",
+          )
+          # Framework property value -> tokens that must appear in the file for the
+          # attribution to be considered verified.
+          FRAMEWORK_TOKENS = {
+              "crewai": ("crewai",),
+              "langgraph": ("langgraph",),
+              "langchain": ("langchain",),
+              "langchain_community": ("langchain_community", "langchain"),
+              "autogen": ("autogen", "ag2"),
+              "ag2": ("autogen", "ag2"),
+              "llamaindex": ("llama_index",),
+              "llama_index": ("llama_index",),
+              "semantic_kernel": ("semantic_kernel",),
+              "mcp": ("mcp",),
+              "openai_agents": ("agents", "openai"),
+              "openai": ("openai",),
+              "pydantic_ai": ("pydantic_ai",),
+              "smolagents": ("smolagents",),
+              "haystack": ("haystack",),
+              "google_adk": ("google.adk",),
+              "agno": ("agno",),
+          }
+
+          # Base classes that mean "this is an agent / LLM component".
+          AGENT_BASES = {
+              "Agent", "BaseAgent", "ConversableAgent", "AssistantAgent", "UserProxyAgent",
+              "RoutedAgent", "BaseChatAgent", "ChatAgent", "ReActAgent", "FunctionAgent",
+              "Crew", "Flow", "Workflow", "StateGraph", "Runnable", "RunnableSerializable",
+              "Chain", "LLMChain", "BaseChatModel", "BaseLLM", "LLM", "SimpleChatModel",
+              "BaseTool", "Tool", "StructuredTool", "CodeAgent", "ToolCallingAgent", "MultiStepAgent",
+          }
+          # Base classes / decorators that mean "this is data, not an agent".
+          DATA_BASES = {
+              "BaseModel", "Base", "DeclarativeBase", "Model", "SQLModel", "TypedDict", "NamedTuple",
+              "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "PyEnum", "Schema", "Serializer",
+              "ModelSerializer", "BaseSettings", "Document", "EmbeddedDocument", "DynamicDocument",
+              "Exception", "BaseException", "ValueError", "RuntimeError", "Struct", "Message",
+              "TestCase", "IsolatedAsyncioTestCase",
+          }
+          DATA_DECORATORS = re.compile(r"@(?:dataclasses\.)?dataclass\b|@attr\.s\b|@attrs\.define\b|@define\b|@frozen\b")
+
+          # Strong source signals that a class/body uses an LLM, agent runtime or tools.
+          LLM_SIGNAL = re.compile(
+              r"\b(?:Chat(?:OpenAI|Anthropic|Groq|NVIDIA|Ollama|Mistral(?:AI)?|Cohere|VertexAI|"
+              r"GoogleGenerativeAI|Bedrock(?:Converse)?|HuggingFace|Together|Fireworks|LiteLLM|Perplexity|"
+              r"DeepSeek|XAI)|AzureChatOpenAI|create_react_agent|create_tool_calling_agent|"
+              r"create_openai_tools_agent|initialize_agent|AgentExecutor|StateGraph|MessageGraph|"
+              r"Crew\s*\(|AssistantAgent\s*\(|ConversableAgent\s*\(|MultiServerMCPClient|ClientSession|"
+              r"bind_tools|with_structured_output|ChatPromptTemplate|SystemMessage|HumanMessage|"
+              r"chat\.completions\.create|completions\.create|messages\.create|responses\.create|"
+              r"generate_content|Runner\.run|litellm\.completion|BaseChatModel|"
+              r"(?:llm|model|chain|agent|graph|crew|executor|instance)\s*\.\s*a?(?:invoke|stream|run|kickoff|ainvoke|astream)\s*\()"
+          )
+
+          # Name suffix tokens (last CamelCase token) that denote data / helpers.
+          DATA_NAME_TOKENS = {
+              "data", "dataset", "datasets", "record", "records", "row", "rows", "entry", "entries",
+              "execution", "executions", "chart", "metrics", "metric", "stats", "stat", "statistics",
+              "summary", "count", "counts", "logger", "log", "logs", "logging", "schema", "schemas",
+              "dto", "model", "models", "entity", "table", "crud", "repository", "repo", "dao",
+              "processor", "serializer", "response", "request", "payload", "params", "config",
+              "configuration", "settings", "status", "type", "types", "enum", "info", "details",
+              "create", "update", "read", "list", "exception", "error", "test", "tests", "mock",
+              "fixture", "form", "view", "admin", "migration", "id", "ids", "filter", "query",
+          }
+          AGENT_NAME_SUFFIX = re.compile(r"(?:Agent|Agents|Graph|Crew|Swarm|Supervisor)$")
+
+          # Framework result / message / output types: data structures, never a model or agent.
+          FRAMEWORK_RESULT_PATH = re.compile(
+              r"(?:^|\.)(?:outputs|messages|output_parsers|prompt_values|callbacks|documents|"
+              r"schema\.(?:messages|output|document))\.[A-Za-z_]\w*$")
+          RESULT_CLASS_NAMES = {
+              "ChatGeneration", "ChatGenerationChunk", "ChatResult", "Generation", "GenerationChunk",
+              "LLMResult", "AIMessage", "AIMessageChunk", "HumanMessage", "SystemMessage", "ToolMessage",
+              "FunctionMessage", "ChatMessage", "BaseMessage", "BaseMessageChunk", "RemoveMessage",
+              "ToolCall", "PromptValue", "ChatPromptValue", "StringPromptValue", "AgentAction",
+              "AgentFinish", "AgentStep", "ChatCompletion", "ChatCompletionMessage", "Completion",
+              "CreateEmbeddingResponse", "Choice", "Usage", "ContentBlock", "TextBlock", "ToolUseBlock",
+          }
+          # Generic (stdlib / web / data-science) classes that are never AI models.
+          GENERIC_NON_AI_CLASSES = {
+              "Process", "Thread", "Pool", "Queue", "SimpleQueue", "Manager", "Popen", "Timer", "Lock",
+              "RLock", "Event", "Semaphore", "Condition", "Barrier", "Path", "PurePath", "Session",
+              "Logger", "Formatter", "Handler", "datetime", "date", "timedelta", "Decimal", "UUID",
+              "Counter", "OrderedDict", "defaultdict", "deque", "ThreadPoolExecutor",
+              "ProcessPoolExecutor", "Future", "Flask", "FastAPI", "APIRouter", "Engine", "Connection",
+              "Cursor", "BytesIO", "StringIO", "Canvas", "Workbook", "DataFrame", "Series", "Template",
+              "ArgumentParser", "ConfigParser", "TemporaryDirectory", "NamedTemporaryFile",
+          }
+          # LLM / embedding client constructors.
+          LLM_CLIENT_NAMES = {
+              "OpenAI", "AsyncOpenAI", "AzureOpenAI", "AsyncAzureOpenAI", "Anthropic", "AsyncAnthropic",
+              "AnthropicBedrock", "AnthropicVertex", "Groq", "AsyncGroq", "Mistral", "MistralClient",
+              "Cohere", "CohereClient", "ClientV2", "InferenceClient", "AsyncInferenceClient", "Together",
+              "AsyncTogether", "Replicate", "GenerativeModel", "Ollama", "OllamaLLM", "ChatCompletionsClient",
+              "HuggingFaceEndpoint", "HuggingFaceHub", "HuggingFacePipeline", "VertexAI", "BedrockLLM",
+              "LlamaCpp", "VLLM", "VLLMOpenAI", "Bedrock", "Fireworks", "Cerebras",
+          }
+          LLM_CLIENT_PATTERN = re.compile(r"^(?:Async)?(?:Azure)?Chat[A-Z]\w+$|^\w*(?:LLM|ChatModel|Embeddings)$")
+          # Model-id heuristics (names such as "gpt-4o", "llama2", "meta/llama-3.1-70b-instruct").
+          MODEL_FAMILY = re.compile(
+              r"(?i)(?:^|[/:_\-.])(?:gpt-?\d|gpt-?4o|o[1-9](?:-mini|-pro)?$|chatgpt|davinci|babbage|text-embedding|"
+              r"embed|whisper|dall-?e|tts-|claude|llama|codellama|mistral|mixtral|codestral|ministral|"
+              r"gemma|gemini|palm|bison|qwen|phi-?\d|deepseek|command|nemotron|nemo|falcon|vicuna|glm|"
+              r"yi-|grok|titan|jurassic|sonar|starcoder|wizard|orca|bloom|flan|bert|roberta|minilm|bge-|"
+              r"e5-|nomic|stable-?diffusion|sdxl|flux|kimi|moonshot|granite|olmo|dbrx|jamba|arctic|"
+              r"solar|zephyr|openchat|hermes|nous|sentence-transformers|all-mpnet)")
+          MODEL_ORG_SHAPE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.:-]+$")
+          MODEL_SIZE = re.compile(r"(?i)\d+(?:\.\d+)?[bm](?:\b|[-_])|-instruct|-chat\b|:latest$|-preview\b")
+
+          # Env endpoint classification ------------------------------------------------
+          AI_ENV_SUBSTRINGS = (
+              "openai", "anthropic", "claude", "groq", "nvidia", "gemini", "vertex", "bedrock",
+              "mistral", "cohere", "huggingface", "ollama", "together", "replicate", "perplexity",
+              "deepseek", "openrouter", "fireworks", "litellm", "langchain", "langsmith", "langfuse",
+              "llama", "inference", "embedding", "watsonx", "dashscope", "qwen", "moonshot", "voyage",
+              "pinecone", "weaviate", "qdrant", "chroma", "milvus",
+          )
+          AI_ENV_TOKENS = {"llm", "mcp", "model", "models", "ai", "xai", "gpt", "hf", "nim", "tgi",
+                           "vllm", "aoai", "genai", "agent", "agents", "rag", "vector", "embeddings"}
+          NON_AI_ENV_TOKENS = {
+              "db", "database", "postgres", "postgresql", "pg", "mysql", "mariadb", "mongo", "mongodb",
+              "redis", "memcached", "s3", "wasabi", "minio", "bucket", "storage", "blob", "gcs", "cdn",
+              "smtp", "mail", "email", "mqtt", "broker", "kafka", "rabbit", "rabbitmq", "amqp", "elastic",
+              "elasticsearch", "opensearch", "sentry", "stripe", "sftp", "ftp", "ldap", "vault", "sqs",
+              "sns", "webhook", "slack", "twilio", "frontend", "dashboard", "grafana", "prometheus",
+              "nvd", "otx", "cve", "jira", "github", "gitlab", "bitbucket", "oauth", "auth", "sso",
+          }
+          AI_HOST_SUFFIXES = (
+              "openai.com", "openai.azure.com", "anthropic.com", "groq.com", "nvidia.com",
+              "generativelanguage.googleapis.com", "aiplatform.googleapis.com", "mistral.ai", "cohere.ai",
+              "cohere.com", "huggingface.co", "hf.space", "together.xyz", "together.ai", "replicate.com",
+              "perplexity.ai", "deepseek.com", "x.ai", "openrouter.ai", "fireworks.ai", "ollama.com",
+              "ollama.ai", "anyscale.com", "deepinfra.com", "cerebras.ai", "sambanova.ai", "ai21.com",
+              "voyageai.com", "pinecone.io", "langchain.com", "smith.langchain.com", "cloud.langfuse.com",
+              "services.ai.azure.com", "cognitiveservices.azure.com", "inference.ai.azure.com",
+          )
+          AI_HOST_PATTERN = re.compile(r"(?:^|\.)bedrock(?:-runtime|-agent(?:-runtime)?)?\.[a-z0-9-]+\.amazonaws\.com$|"
+                                       r"(?:^|\.)(?:api\.)?runpod\.ai$|(?:^|\.)modal\.run$")
+          AI_PORTS = {11434}  # ollama default
+          NON_AI_HOST_PATTERN = re.compile(
+              r"wasabisys\.com$|(?:^|\.)s3[.-][a-z0-9.-]*amazonaws\.com$|^s3\.amazonaws\.com$|"
+              r"blob\.core\.windows\.net$|storage\.googleapis\.com$|digitaloceanspaces\.com$|"
+              r"r2\.cloudflarestorage\.com$|backblazeb2\.com$|mongodb\.net$|rds\.amazonaws\.com$|"
+              r"redis|postgres|mysql|database\.windows\.net$")
+          ENV_MODEL_TYPES = {"machine-learning-model", "llm_endpoint", "model", "endpoint", "api_endpoint",
+                             "env_endpoint", "data"}
+
+          MANIFEST_NAMES = {
+              "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg", "pipfile", "pipfile.lock",
+              "poetry.lock", "uv.lock", "environment.yml", "environment.yaml", "conda.yml",
+              "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "go.mod", "go.sum",
+              "cargo.toml", "cargo.lock", "pom.xml", "build.gradle", "build.gradle.kts", "gemfile",
+              "gemfile.lock", "composer.json", "composer.lock",
+          }
+          SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", "site-packages", "venv",
+                       ".venv", "env", ".tox", ".mypy_cache", ".pytest_cache", "dist", "build"}
+          MAX_FILE_BYTES = 2_000_000
+          MAX_INDEX_FILES = 20_000
+          MAX_BODY_LINES = 1500
+
+
+          # --------------------------------------------------------------------------
+          # Small helpers
+          # --------------------------------------------------------------------------
+          def _prop(comp: dict, name: str) -> str | None:
+              for p in comp.get("properties") or ():
+                  if isinstance(p, dict) and p.get("name") == name:
+                      return p.get("value")
+              return None
+
+
+          def _set_prop(comp: dict, name: str, value: str) -> None:
+              props = comp.setdefault("properties", [])
+              for p in props:
+                  if isinstance(p, dict) and p.get("name") == name:
+                      p["value"] = value
+                      return
+              props.append({"name": name, "value": value})
+
+
+          def _strip_comments(code: str) -> str:
+              """Drop full-line and trailing ``#`` comments (good enough for signal matching)."""
+              out = []
+              for l in code.split("\n"):
+                  if l.lstrip().startswith("#"):
+                      continue
+                  out.append(re.sub(r"\s+#[^'\"]*$", "", l))
+              return "\n".join(out)
+
+
+          def _camel_tokens(name: str) -> list[str]:
+              base = re.split(r"[.:]", name)[-1]
+              return [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", base)]
+
+
+          def _env_tokens(var: str) -> list[str]:
+              return [t for t in re.split(r"[^a-z0-9]+", var.lower()) if t]
+
+
+          def _is_manifest(path: str | None) -> bool:
+              if not path:
+                  return False
+              b = os.path.basename(path).lower()
+              return b in MANIFEST_NAMES or bool(re.match(r"requirements[-_.\w]*\.(txt|in)$", b))
+
+
+          def _ctype(comp: dict) -> str:
+              return _prop(comp, P_TYPE) or comp.get("type") or "unknown"
+
+
+          class _Paths:
+              """Normalises the (often absolute) paths emitted by cisco-aibom."""
+
+              def __init__(self, aibom: dict, repo_root: str | None):
+                  self.repo_root = os.path.realpath(repo_root) if repo_root else None
+                  files = [_prop(c, P_FILE) for c in aibom.get("components") or () if isinstance(c, dict)]
+                  files += [_prop(v, P_FILE) for v in aibom.get("vulnerabilities") or () if isinstance(v, dict)]
+                  abs_files = [f for f in files if f and os.path.isabs(f)]
+                  self.scan_root = self._infer_scan_root(abs_files)
+
+              def _infer_scan_root(self, abs_files: list[str]) -> str | None:
+                  if not abs_files:
+                      return None
+                  if self.repo_root:
+                      # Prefer the repo root itself if the tool scanned it in place.
+                      rr = self.repo_root
+                      if all(os.path.realpath(f).startswith(rr + os.sep) for f in abs_files):
+                          return rr
+                      # Otherwise find the prefix P such that P/<rel> exists under repo_root.
+                      for f in abs_files:
+                          parts = f.split("/")
+                          for i in range(1, len(parts)):
+                              rel = "/".join(parts[i:])
+                              if rel and os.path.exists(os.path.join(rr, rel)):
+                                  return "/".join(parts[:i]) or "/"
+                  try:
+                      common = os.path.commonpath(abs_files)
+                  except ValueError:
+                      return None
+                  if len(abs_files) == 1 or os.path.isfile(common):
+                      common = os.path.dirname(common)
+                  return common
+
+              def rel(self, path: str | None) -> str | None:
+                  if not path:
+                      return None
+                  p = path.replace("\\", "/")
+                  for root in (self.scan_root, self.repo_root):
+                      if root and os.path.isabs(p):
+                          r = root.rstrip("/") + "/"
+                          if p.startswith(r):
+                              return p[len(r):]
+                          rp = os.path.realpath(p)
+                          if rp.startswith(r):
+                              return rp[len(r):]
+                  if p.startswith("./"):
+                      p = p[2:]
+                  return p
+
+              def abs(self, rel: str | None) -> str | None:
+                  if not rel or not self.repo_root:
+                      return None
+                  if os.path.isabs(rel):
+                      rel = self.rel(rel) or rel
+                  p = os.path.normpath(os.path.join(self.repo_root, rel))
+                  return p if p.startswith(self.repo_root) else None
+
+
+          class _Source:
+              """Lazy, cached access to repository source for evidence checks."""
+
+              def __init__(self, paths: _Paths):
+                  self.paths = paths
+                  self._text: dict[str, str | None] = {}
+                  self._index: dict[str, list[tuple[str, int]]] | None = None
+
+              def text(self, rel: str | None) -> str | None:
+                  if not rel:
+                      return None
+                  if rel in self._text:
+                      return self._text[rel]
+                  p = self.paths.abs(rel)
+                  t = None
+                  if p and os.path.isfile(p):
+                      try:
+                          if os.path.getsize(p) <= MAX_FILE_BYTES:
+                              with open(p, encoding="utf-8", errors="replace") as fh:
+                                  t = fh.read()
+                      except OSError:
+                          t = None
+                  self._text[rel] = t
+                  return t
+
+              def class_index(self) -> dict[str, list[tuple[str, int]]]:
+                  if self._index is not None:
+                      return self._index
+                  idx: dict[str, list[tuple[str, int]]] = {}
+                  root = self.paths.repo_root
+                  seen = 0
+                  if root:
+                      for dp, dns, fns in os.walk(root):
+                          dns[:] = [d for d in dns if d not in SKIP_DIRS and not d.startswith(".")]
+                          for fn in fns:
+                              if not fn.endswith(".py"):
+                                  continue
+                              seen += 1
+                              if seen > MAX_INDEX_FILES:
+                                  break
+                              rel = os.path.relpath(os.path.join(dp, fn), root).replace(os.sep, "/")
+                              t = self.text(rel)
+                              if not t:
+                                  continue
+                              for m in re.finditer(r"^[ \t]*class\s+([A-Za-z_]\w*)", t, re.M):
+                                  idx.setdefault(m.group(1), []).append((rel, t.count("\n", 0, m.start()) + 1))
+                  self._index = idx
+                  return idx
+
+
+          # --------------------------------------------------------------------------
+          # Python class resolution / analysis
+          # --------------------------------------------------------------------------
+          def _class_def(text: str, cls: str) -> tuple[list[str], str, bool] | None:
+              """Return (bases, body, decorated_as_data) for ``class cls`` in text."""
+              m = re.search(rf"^([ \t]*)class\s+{re.escape(cls)}\b\s*(\((.*?)\))?\s*:", text, re.M | re.S)
+              if not m:
+                  return None
+              indent = len(m.group(1).expandtabs())
+              bases_raw = m.group(3) or ""
+              bases = []
+              for b in re.split(r",", re.sub(r"\[.*?\]", "", bases_raw)):
+                  b = b.strip()
+                  if not b or "=" in b:  # metaclass=..., total=False
+                      continue
+                  bases.append(b.split(".")[-1])
+              before = text[: m.start()].rstrip("\n").split("\n")[-4:]
+              decorated_data = any(DATA_DECORATORS.search(l) for l in before)
+              lines = text[m.end():].split("\n")
+              body = []
+              for l in lines[:MAX_BODY_LINES]:
+                  s = l.strip()
+                  if s and not s.startswith("#") and len(l.expandtabs()) - len(l.expandtabs().lstrip()) <= indent and body:
+                      break
+                  body.append(l)
+              return bases, "\n".join(body), decorated_data
+
+
+          def _module_to_rel(module: str, from_rel: str, src: _Source) -> list[str]:
+              """Map an import module (possibly relative) to candidate repo files."""
+              if module.startswith("."):
+                  dots = len(module) - len(module.lstrip("."))
+                  base = os.path.dirname(from_rel)
+                  for _ in range(dots - 1):
+                      base = os.path.dirname(base)
+                  rest = module.lstrip(".").replace(".", "/")
+                  stem = f"{base}/{rest}" if base and rest else (base or rest)
+              else:
+                  stem = module.replace(".", "/")
+              stem = stem.strip("/")
+              return [c for c in (f"{stem}.py", f"{stem}/__init__.py") if src.text(c) is not None]
+
+
+          def _imported_from(text: str, sym: str) -> str | None:
+              pat = re.compile(r"^[ \t]*from\s+([.\w]+)\s+import\s+(\([^)]*\)|[^\n]*)", re.M)
+              for m in pat.finditer(text):
+                  names = re.sub(r"[()\n\\]", " ", m.group(2))
+                  for item in names.split(","):
+                      parts = item.split()
+                      if parts and (parts[0] == sym or (len(parts) == 3 and parts[2] == sym)):
+                          return m.group(1)
+              return None
+
+
+          def _resolve_class(sym: str, module_hint: str | None, from_rel: str | None, src: _Source,
+                             depth: int = 0) -> tuple[str, list[str], str, bool] | None:
+              """Find the local definition of a class. Returns (rel, bases, body, data_deco)."""
+              if depth > 4:
+                  return None
+              cands: list[str] = []
+              if from_rel and module_hint:
+                  cands += _module_to_rel(module_hint, from_rel, src)
+              if from_rel:
+                  t = src.text(from_rel)
+                  if t is not None:
+                      d = _class_def(t, sym)
+                      if d:
+                          return (from_rel, *d)
+                      mod = _imported_from(t, sym)
+                      if mod:
+                          cands += _module_to_rel(mod, from_rel, src)
+              for c in cands:
+                  t = src.text(c) or ""
+                  d = _class_def(t, sym)
+                  if d:
+                      return (c, *d)
+                  mod = _imported_from(t, sym)  # re-export via __init__.py
+                  if mod:
+                      r = _resolve_class(sym, mod, c, src, depth + 1)
+                      if r:
+                          return r
+              defs = src.class_index().get(sym, [])
+              if from_rel and len(defs) > 1:
+                  d0 = os.path.dirname(from_rel)
+                  near = [d for d in defs if os.path.dirname(d[0]) == d0]
+                  defs = near or defs
+              if len(defs) == 1:
+                  rel = defs[0][0]
+                  d = _class_def(src.text(rel) or "", sym)
+                  if d:
+                      return (rel, *d)
+              return None
+
+
+          def _classify_class(sym: str, rel: str, bases: list[str], body: str, data_deco: bool,
+                              src: _Source, depth: int = 0) -> tuple[str, str]:
+              """Return ("agent"|"data"|"plain", evidence)."""
+              if data_deco:
+                  return "data", f"{rel}: class {sym} is a @dataclass/attrs record"
+              for b in bases:
+                  if b in DATA_BASES:
+                      return "data", f"{rel}: class {sym}({b}) is a data/ORM/schema class"
+              for b in bases:
+                  if b in ("ABC", "object", "Generic", "Protocol"):
+                      continue
+                  # Resolve local base classes first (e.g. Agent(Base) vs crewai Agent).
+                  if depth < 3:
+                      r = _resolve_class(b, None, rel, src, depth + 1)
+                      if r:
+                          kind, ev = _classify_class(b, r[0], r[1], r[2], r[3], src, depth + 1)
+                          if kind in ("agent", "data"):
+                              return kind, f"{rel}: class {sym}({b}) <- {ev}"
+                          continue
+                  if b in AGENT_BASES or AGENT_NAME_SUFFIX.search(b):
+                      return "agent", f"{rel}: class {sym}({b}) subclasses an agent/LLM base"
+              m = LLM_SIGNAL.search(_strip_comments(body))
+              if m:
+                  return "agent", f"{rel}: class {sym} uses `{m.group(0).strip()[:40]}`"
+              return "plain", f"{rel}: class {sym} has no agent base or LLM usage"
+
+
+          def _file_mentions(text: str, tokens: tuple[str, ...]) -> bool:
+              for tok in tokens:
+                  if re.search(rf"^[ \t]*(?:from|import)\s+{re.escape(tok)}\b", text, re.M):
+                      return True
+              return False
+
+
+          # --------------------------------------------------------------------------
+          # Component judges
+          # --------------------------------------------------------------------------
+          def _known_fw(fw: str) -> str:
+              """The framework property is sometimes the enclosing scope (e.g. a function
+              name) rather than a framework; only accept recognised framework names."""
+              fw = (fw or "").strip().lower()
+              if fw in FRAMEWORK_TOKENS or fw in AI_FRAMEWORK_MODULES or fw.split(".")[0] in AI_FRAMEWORK_MODULES:
+                  return fw
+              return ""
+
+
+          def _split_symbol(name: str) -> tuple[str, str | None]:
+              """'.models.Agent' -> ('Agent', '.models'); 'a.b.C' -> ('C', 'a.b')."""
+              sym = re.split(r"[.:]", name)[-1] or name
+              module_hint = name.rsplit(".", 1)[0] if "." in name.strip(".") else None
+              if module_hint is not None and name.startswith(".") and not module_hint.startswith("."):
+                  module_hint = "." + module_hint
+              return sym, module_hint
+
+
+          def _framework_top_module(name: str, module_hint: str | None, rel: str | None, src) -> str:
+              top_mod = (module_hint or "").lstrip(".").split(".")[0]
+              if (top_mod and not name.startswith(".") and top_mod in {m.split(".")[0] for m in AI_FRAMEWORK_MODULES}
+                      and not (src and _module_to_rel(top_mod, rel or "", src))):  # not a local package
+                  return top_mod
+              return ""
+
+
+          def _result_type(name: str) -> bool:
+              sym = re.split(r"[.:]", name)[-1]
+              return bool(FRAMEWORK_RESULT_PATH.search(name)) or sym in RESULT_CLASS_NAMES
+
+
+          def _line_of(comp: dict) -> int:
+              try:
+                  return int(_prop(comp, P_LINE) or 0)
+              except ValueError:
+                  return 0
+
+
+          def _window(text: str, line: int, before: int = 1, after: int = 3) -> str:
+              if line <= 0:
+                  return ""
+              lines = text.split("\n")
+              return _strip_comments("\n".join(lines[max(0, line - 1 - before): line + after]))
+
+
+          def _judge_agent(comp: dict, rel: str | None, src: _Source | None) -> tuple[str, str, str]:
+              """Return (decision, confidence, evidence); decision is 'keep' or 'suppress'."""
+              name = comp.get("name") or ""
+              raw_fw = (_prop(comp, P_FW) or "").strip()
+              fw = _known_fw(raw_fw)
+              sym, module_hint = _split_symbol(name)
+              tokens = _camel_tokens(name)
+              data_name = bool(tokens) and tokens[-1] in DATA_NAME_TOKENS and not AGENT_NAME_SUFFIX.search(sym)
+              agent_name = bool(AGENT_NAME_SUFFIX.search(sym))
+
+              if _result_type(name):
+                  return "suppress", "", f"`{name}` is a framework message/result type (data structure), not an agent"
+              top_mod = (module_hint or "").lstrip(".").split(".")[0]
+              if (top_mod and not name.startswith(".") and top_mod in {m.split(".")[0] for m in AI_FRAMEWORK_MODULES}
+                      and not (src and _module_to_rel(top_mod, rel or "", src))):  # not a local package
+                  return "keep", "high", f"symbol from agent framework module `{top_mod}`"
+
+              text = src.text(rel) if (src and rel) else None
+              if src is None or text is None:
+                  # No source available: rely on tool metadata + naming.
+                  if fw:
+                      return "keep", "high", f"framework={fw} reported by scanner"
+                  if data_name:
+                      return "suppress", "", f"name `{name}` denotes a data/helper class ({tokens[-1]})"
+                  if agent_name:
+                      return "keep", "medium", "name denotes an agent"
+                  return "keep", "low", "no framework and no source evidence"
+
+              fw_verified = bool(fw) and _file_mentions(text, FRAMEWORK_TOKENS.get(fw, (fw,)))
+              resolved = _resolve_class(sym, module_hint, rel, src)
+              kind, ev = ("unresolved", "")
+              if resolved:
+                  kind, ev = _classify_class(sym, resolved[0], resolved[1], resolved[2], resolved[3], src)
+
+              if kind == "data":
+                  why = f"resolves to local data class: {ev}"
+                  if fw and not fw_verified:
+                      why = f"framework={fw} not imported in {rel}; " + why
+                  return "suppress", "", why
+              if fw_verified:
+                  return "keep", "high", f"framework={fw} imported in {rel}" + (f"; {ev}" if kind == "agent" else "")
+              if kind == "agent":
+                  return "keep", "high", ev
+              # Direct LLM usage around the reported line (e.g. `x = create_react_agent(...)`).
+              try:
+                  line = int(_prop(comp, P_LINE) or 0)
+              except ValueError:
+                  line = 0
+              if line > 0 and kind == "unresolved":  # e.g. `self.x = create_react_agent(...)`
+                  lines = text.split("\n")
+                  window = "\n".join(lines[line - 1: line + 3])
+                  m = LLM_SIGNAL.search(_strip_comments(window))
+                  if m and not data_name:
+                      return "keep", "high", f"{rel}:{line} uses `{m.group(0).strip()[:40]}`"
+              if data_name:
+                  return "suppress", "", f"name `{name}` denotes a data/helper class ({tokens[-1]})" + (
+                      f"; {ev}" if ev else "")
+              if fw:
+                  return "keep", "low", f"framework={fw} reported but not imported in {rel}" + (f"; {ev}" if ev else "")
+              if agent_name:
+                  # Agent-named class without its own LLM use: still an agent-system node if
+                  # the file that reports it pulls in an agent framework.
+                  if any(_file_mentions(text, (m,)) for m in AI_FRAMEWORK_MODULES if m != "agents"):
+                      return "keep", "medium", f"agent-named; {rel} imports an agent/LLM framework" + (f"; {ev}" if ev else "")
+                  return "keep", "medium", "name denotes an agent" + (f"; {ev}" if ev else "")
+              return "keep", "low", ev or "could not resolve definition"
+
+
+          def _looks_like_class_symbol(name: str) -> bool:
+              """Python symbol (``Foo``, ``pkg.mod.Foo``, ``.models.Task``) vs a model id."""
+              return bool(re.fullmatch(r"\.?(?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*", name)) and \
+                  bool(re.match(r"[A-Z_]", re.split(r"[.:]", name)[-1] or "x"))
+
+
+          def _judge_model_id(comp: dict, rel: str | None) -> tuple[str, str, str]:
+              name = comp.get("name") or ""
+              var = None
+              m = re.search(r"`([A-Za-z_][A-Za-z0-9_]*)`", comp.get("description") or "")
+              if m:
+                  var = m.group(1)
+              var_ai = bool(var) and (any(s in var.lower() for s in AI_ENV_SUBSTRINGS)
+                                      or bool(set(_env_tokens(var)) & AI_ENV_TOKENS))
+              fam = MODEL_FAMILY.search(name)
+              shaped = bool(MODEL_ORG_SHAPE.match(name)) or bool(MODEL_SIZE.search(name))
+              src_note = f" (from `{var}`)" if var else ""
+              if fam:
+                  return "keep", "high", f"model id matches known model family `{fam.group(0).strip('/:_-.')}`{src_note}"
+              if shaped and var_ai:
+                  return "keep", "high", f"model id shape (org/model or size suffix) and AI variable{src_note}"
+              if shaped or var_ai:
+                  return "keep", "medium", ("model id shape (org/model or size suffix)" if shaped
+                                            else "value of an AI/LLM model variable") + src_note
+              return "keep", "low", "model-like string without a recognised family" + src_note
+
+
+          def _judge_model(comp: dict, rel: str | None, src: _Source | None,
+                           kept_agents: dict[str, list[tuple[str, str | None, str | None]]]
+                           ) -> tuple[str, str, str]:
+              """Judge a non-env model component.
+
+              Returns (decision, confidence_or_ref, evidence) where decision is 'keep',
+              'suppress' or 'duplicate' (then the 2nd item is the surviving bom-ref).
+              """
+              name = comp.get("name") or ""
+              if not _looks_like_class_symbol(name):
+                  return _judge_model_id(comp, rel)
+
+              raw_fw = (_prop(comp, P_FW) or "").strip()
+              fw = _known_fw(raw_fw)
+              sym, module_hint = _split_symbol(name)
+              line = _line_of(comp)
+              fw_note = f"; framework property `{raw_fw}` is not a framework (enclosing scope)" if raw_fw and not fw else ""
+
+              if _result_type(name):
+                  return "suppress", "", f"`{name}` is a framework result/message/output type, not a model"
+
+              text = src.text(rel) if (src and rel) else None
+              top_mod = _framework_top_module(name, module_hint, rel, src)
+              is_client = sym in LLM_CLIENT_NAMES or bool(LLM_CLIENT_PATTERN.match(sym))
+
+              # Same name as an agent we kept -> duplicate / misclassification.
+              for aref, arel, adef in kept_agents.get(sym, []):
+                  same = rel is not None and rel in (arel, adef)
+                  if not same and src is not None and not top_mod:
+                      r = _resolve_class(sym, module_hint, rel, src)
+                      same = bool(r) and r[0] == adef
+                  if same:
+                      where = f" at {arel}" if arel else ""
+                      return "duplicate", aref, (f"`{sym}` is already reported as an agent{where} (class defined in "
+                                                 f"{adef or rel}); model entry is a misclassification")
+
+              if top_mod:
+                  if is_client:
+                      return "keep", "high", f"LLM client/chat-model class from `{top_mod}`"
+                  return "keep", "low", f"symbol from AI framework `{top_mod}` but not clearly a model"
+
+              if sym in GENERIC_NON_AI_CLASSES and not is_client:
+                  ev = f"`{sym}` is a generic non-AI class"
+                  if text is not None:
+                      m = re.search(rf"\b([A-Za-z_][\w.]*)\.{re.escape(sym)}\s*\(", _window(text, line))
+                      imp = _imported_from(text, sym)
+                      if m:
+                          ev += f" (`{m.group(1).split('.')[-1]}.{sym}(` at line {line})"
+                      elif imp:
+                          ev += f" (imported from `{imp}`)"
+                      if imp and imp.split(".")[0].lstrip(".") in {x.split(".")[0] for x in AI_FRAMEWORK_MODULES}:
+                          return "keep", "low", f"`{sym}` imported from AI module `{imp}`"
+                  return "suppress", "", ev + fw_note
+
+              if src is None or text is None:
+                  if is_client:
+                      return "keep", "medium", f"`{sym}` is a known LLM client class"
+                  if fw:
+                      return "keep", "medium", f"framework={fw} reported by scanner"
+                  return "keep", "low", "no source evidence" + fw_note
+
+              resolved = _resolve_class(sym, module_hint, rel, src)
+              if resolved:
+                  kind, ev = _classify_class(sym, resolved[0], resolved[1], resolved[2], resolved[3], src)
+                  if kind == "data":
+                      why = f"resolves to local data class: {ev}"
+                      if fw and not _file_mentions(text, FRAMEWORK_TOKENS.get(fw, (fw,))):
+                          why = f"framework={fw} not imported in {rel}; " + why
+                      return "suppress", "", why
+                  if kind == "agent":
+                      return "keep", "low", f"local agent/LLM class reported as a model: {ev}"
+                  # plain local class: fall through to client / framework checks
+              if is_client:
+                  win = _window(text, line)
+                  imp = _imported_from(text, sym)
+                  if re.search(rf"\b{re.escape(sym)}\s*\(", win) and (imp or re.search(rf"\b{re.escape(sym)}\b", text)):
+                      return "keep", "high", f"LLM client constructor `{sym}(` at {rel}:{line}" + (
+                          f" (imported from `{imp}`)" if imp else "")
+                  return "keep", "medium", f"`{sym}` is a known LLM client class" + (f" imported from `{imp}`" if imp else "")
+              if resolved:
+                  return "keep", "low", f"local class with no AI usage: {ev}" + fw_note
+              if fw and _file_mentions(text, FRAMEWORK_TOKENS.get(fw, (fw,))):
+                  return "keep", "medium", f"framework={fw} imported in {rel}"
+              return "keep", "low", "could not resolve definition" + fw_note
+
+
+          def _is_model(comp: dict) -> bool:
+              t = (_prop(comp, P_TYPE) or "").lower()
+              return t in ("model", "llm", "llm_model") or (not t and comp.get("type") == "machine-learning-model")
+
+
+          def _env_var_name(comp: dict) -> str | None:
+              name = comp.get("name") or ""
+              for pat in (r"^env:(\w+)$", r"^env_[a-z_]*?_([A-Z][A-Z0-9_]+)$", r"^env_(\w+)$"):
+                  m = re.match(pat, name)
+                  if m:
+                      return m.group(1)
+              m = re.search(r"`([A-Za-z_][A-Za-z0-9_]*)`", comp.get("description") or "")
+              if m and (_prop(comp, P_FILE) or "").split("/")[-1].startswith(".env"):
+                  return m.group(1)
+              return None
+
+
+          def _env_value_host(rel: str | None, line: int, var: str, src: _Source | None) -> tuple[str | None, int | None]:
+              """Hostname/port of an env value.  The value itself is never returned."""
+              if not src or not rel:
+                  return None, None
+              text = src.text(rel)
+              if text is None:
+                  return None, None
+              lines = text.split("\n")
+              cands = []
+              if 0 < line <= len(lines):
+                  cands.append(lines[line - 1])
+              cands += [l for l in lines if re.match(rf"\s*(?:export\s+)?{re.escape(var)}\s*[=:]", l)]
+              for l in cands:
+                  m = re.match(rf"\s*(?:export\s+)?{re.escape(var)}\s*[=:]\s*(.*)$", l)
+                  if not m:
+                      continue
+                  v = m.group(1).strip().strip("'\"")
+                  if not v:
+                      continue
+                  try:
+                      u = urlparse(v if "://" in v else f"//{v}")
+                      return (u.hostname or None), u.port
+                  except ValueError:
+                      return None, None
+              return None, None
+
+
+          def _judge_env(comp: dict, rel: str | None, src: _Source | None) -> tuple[str, str, str]:
+              var = _env_var_name(comp) or ""
+              low = var.lower()
+              toks = set(_env_tokens(var))
+              ai_hit = next((s for s in AI_ENV_SUBSTRINGS if s in low), None) or next(iter(sorted(toks & AI_ENV_TOKENS)), None)
+              try:
+                  line = int(_prop(comp, P_LINE) or 0)
+              except ValueError:
+                  line = 0
+              host, port = _env_value_host(rel, line, var, src) if var else (None, None)
+              host = (host or "").lower()
+              host_ai = bool(host) and (any(host == h or host.endswith("." + h) for h in AI_HOST_SUFFIXES)
+                                        or bool(AI_HOST_PATTERN.search(host)) or port in AI_PORTS)
+              host_non_ai = bool(host) and bool(NON_AI_HOST_PATTERN.search(host))
+              if ai_hit and host_ai:
+                  return "keep", "high", f"variable name matches `{ai_hit}` and value host is a known AI provider"
+              if host_ai:
+                  return "keep", "high", "value host is a known AI/LLM provider"
+              if ai_hit:
+                  return "keep", "medium" if not host_non_ai else "low", f"variable name matches AI/LLM/MCP term `{ai_hit}`"
+              non = sorted(toks & NON_AI_ENV_TOKENS)
+              if host_non_ai:
+                  return "suppress", "", "value host is a storage/database service, not an AI provider"
+              if non:
+                  return "suppress", "", f"variable name refers to non-AI service ({', '.join(non)})"
+              return "keep", "low", "env endpoint with no AI/LLM/MCP indication"
+
+
+          def _is_env_endpoint(comp: dict, rel: str | None) -> bool:
+              if _prop(comp, P_FW):
+                  return False
+              t = _ctype(comp).lower()
+              name = comp.get("name") or ""
+              if not name.startswith(("env:", "env_")) and re.match(r"\s*model\b", comp.get("description") or "", re.I):
+                  return False  # "Model from `X`": the name is a model id -> model judge
+              from_env = bool(rel) and os.path.basename(rel).startswith(".env") or name.startswith(("env:", "env_"))
+              return from_env and (t in ENV_MODEL_TYPES or comp.get("type") == "machine-learning-model")
+
+
+          # --------------------------------------------------------------------------
+          # Main entry point
+          # --------------------------------------------------------------------------
+          def refine_aibom(aibom: dict, repo_root: str | None = None,
+                           changed_files: list[str] | None = None) -> tuple[dict, list[dict]]:
+              """Refine a cisco-aibom CycloneDX dict.  Returns (refined_aibom, suppressed)."""
+              bom = copy.deepcopy(aibom) if isinstance(aibom, dict) else {}
+              comps = [c for c in bom.get("components") or [] if isinstance(c, dict)]
+              paths = _Paths(bom, repo_root)
+              src = _Source(paths) if paths.repo_root and os.path.isdir(paths.repo_root) else None
+              suppressed: list[dict] = []
+              removed: set[str] = set()     # bom-refs dropped entirely
+              remap: dict[str, str] = {}    # duplicate bom-ref -> surviving bom-ref
+
+              def record(c: dict, rel: str | None, reason: str) -> None:
+                  suppressed.append({"name": c.get("name"), "type": _ctype(c), "file": rel,
+                                     "line": _prop(c, P_LINE), "reason": reason})
+
+              # ---- 1. exact de-duplication (type+name+file+line, and identical bom-refs)
+              stage: list[tuple[dict, str | None]] = []
+              seen_key: dict[tuple, dict] = {}
+              seen_ref: dict[str, dict] = {}
+              for c in comps:
+                  rel = paths.rel(_prop(c, P_FILE))
+                  key = (_ctype(c), c.get("name"), rel, _prop(c, P_LINE))
+                  ref = c.get("bom-ref")
+                  keep = seen_key.get(key) or (seen_ref.get(ref) if ref else None)
+                  if keep is not None:
+                      kref = keep.get("bom-ref")
+                      if ref and kref and ref != kref:
+                          remap[ref] = kref
+                      record(c, rel, f"duplicate: same type/name/file/line as bom-ref {kref}")
+                      continue
+                  seen_key[key] = c
+                  if ref:
+                      seen_ref[ref] = c
+                  stage.append((c, rel))
+
+              # ---- 2. same-entity duplicates: same type+name+file on several lines, and
+              #         env aliases (env:X vs env_api_config_X) in the same file.
+              def ent_key(c: dict, rel: str | None) -> tuple:
+                  var = _env_var_name(c) if _is_env_endpoint(c, rel) else None
+                  return ("env", rel, var) if var else (_ctype(c), c.get("name"), rel)
+
+              groups: dict[tuple, list[tuple[dict, str | None]]] = {}
+              for c, rel in stage:
+                  groups.setdefault(ent_key(c, rel), []).append((c, rel))
+              stage2: list[tuple[dict, str | None]] = []
+              for c, rel in stage:
+                  grp = groups[ent_key(c, rel)]
+                  if len(grp) == 1:
+                      stage2.append((c, rel))
+                      continue
+                  # Prefer: has framework, canonical env: name, lowest line.
+                  def rank(item):
+                      cc = item[0]
+                      try:
+                          ln = int(_prop(cc, P_LINE) or 0)
+                      except ValueError:
+                          ln = 0
+                      return (0 if _prop(cc, P_FW) else 1, 0 if (cc.get("name") or "").startswith("env:") else 1, ln)
+                  winner = min(grp, key=rank)[0]
+                  if c is winner:
+                      others = sorted({str(_prop(o, P_LINE)) for o, _ in grp if o is not winner and _prop(o, P_LINE)})
+                      if others:
+                          _set_prop(c, P_EXTRA_LINES, ",".join(others))
+                      stage2.append((c, rel))
+                  else:
+                      if c.get("bom-ref") and winner.get("bom-ref"):
+                          remap[c["bom-ref"]] = winner["bom-ref"]
+                      record(c, rel, f"duplicate: same entity as {winner.get('name')} "
+                                     f"(line {_prop(winner, P_LINE)}); line kept in {P_EXTRA_LINES}")
+
+              # ---- 3. precision filters
+              # Agents and env endpoints first, so model judging can see the kept agents.
+              kept_agents: dict[str, list[tuple[str, str | None, str | None]]] = {}
+              verdicts: dict[int, tuple[str, str, str]] = {}
+              for c, rel in stage2:
+                  if _ctype(c).lower() == "agent":
+                      verdicts[id(c)] = v = _judge_agent(c, rel, src)
+                      if v[0] == "keep":
+                          sym, hint = _split_symbol(c.get("name") or "")
+                          r = _resolve_class(sym, hint, rel, src) if src else None
+                          kept_agents.setdefault(sym, []).append((c.get("bom-ref") or "", rel, r[0] if r else None))
+                  elif _is_env_endpoint(c, rel):
+                      verdicts[id(c)] = _judge_env(c, rel, src)
+              for c, rel in stage2:
+                  if id(c) not in verdicts and _is_model(c):
+                      verdicts[id(c)] = _judge_model(c, rel, src, kept_agents)
+
+              stage3: list[tuple[dict, str | None]] = []
+              for c, rel in stage2:
+                  decision = verdicts.get(id(c))
+                  if decision:
+                      verdict, conf, ev = decision
+                      if verdict == "suppress":
+                          removed.add(c.get("bom-ref") or "")
+                          record(c, rel, f"false-positive: {ev}")
+                          continue
+                      if verdict == "duplicate":
+                          if c.get("bom-ref") and conf:
+                              remap[c["bom-ref"]] = conf
+                          else:
+                              removed.add(c.get("bom-ref") or "")
+                          record(c, rel, f"duplicate: {ev}")
+                          continue
+                      _set_prop(c, P_CONF, conf)
+                      if ev:
+                          _set_prop(c, P_EVID, ev[:300])
+                  stage3.append((c, rel))
+
+              # ---- 4. incremental scope
+              if changed_files is not None:
+                  changed = {paths.rel(f) or f for f in changed_files if f}
+                  changed = {f[2:] if f.startswith("./") else f for f in changed}
+                  manifest_changed = any(_is_manifest(f) for f in changed)
+                  changed_dirs_lock = {os.path.dirname(f) for f in changed if _is_manifest(f)}
+                  stage4 = []
+                  for c, rel in stage3:
+                      if rel is None:
+                          in_scope = manifest_changed if _ctype(c).lower() == "dependency" else True
+                      elif rel in changed:
+                          in_scope = True
+                      elif _is_manifest(rel) and os.path.dirname(rel) in changed_dirs_lock:
+                          in_scope = True  # e.g. lockfile changed next to the manifest
+                      else:
+                          in_scope = False
+                      if in_scope:
+                          stage4.append((c, rel))
+                      else:
+                          removed.add(c.get("bom-ref") or "")
+                          record(c, rel, "out-of-scope: file not in changed_files")
+                  stage3 = stage4
+                  in_scope_refs = {c.get("bom-ref") for c, _ in stage3 if c.get("bom-ref")}
+                  vulns = []
+                  for v in bom.get("vulnerabilities") or []:
+                      if not isinstance(v, dict):
+                          continue
+                      raw = _prop(v, P_FILE)
+                      vrel = paths.rel(raw)
+                      aff = [remap.get(a.get("ref"), a.get("ref")) for a in v.get("affects") or [] if isinstance(a, dict)]
+                      if vrel is not None:
+                          keep_v = vrel in changed
+                      elif aff:  # no file: in scope if it affects an in-scope component
+                          keep_v = any(r in in_scope_refs for r in aff)
+                      else:
+                          keep_v = True
+                      if keep_v:
+                          vulns.append(v)
+                      else:
+                          vid = v.get("id") or ""
+                          if raw and vid:
+                              vid = vid.replace(f"_{raw}_{_prop(v, P_LINE)}", "").replace(f"_{raw}", "")
+                          vid = re.sub(r"_/.*$", "", vid)
+                          suppressed.append({"name": vid or v.get("description"),
+                                             "type": _prop(v, P_TYPE) or "vulnerability", "file": vrel,
+                                             "line": _prop(v, P_LINE), "reason": "out-of-scope: file not in changed_files"})
+                  if "vulnerabilities" in bom:
+                      bom["vulnerabilities"] = vulns
+              for v in bom.get("vulnerabilities") or []:
+                  if isinstance(v, dict):
+                      vrel = paths.rel(_prop(v, P_FILE))
+                      if vrel and vrel != _prop(v, P_FILE):
+                          _set_prop(v, P_RELFILE, vrel)
+
+              # ---- 5. relative file annotation + rebuild
+              out = []
+              for c, rel in stage3:
+                  if rel and rel != _prop(c, P_FILE):
+                      _set_prop(c, P_RELFILE, rel)
+                  out.append(c)
+              if "components" in bom or out:
+                  bom["components"] = out
+              kept_refs = {c.get("bom-ref") for c in out if c.get("bom-ref")}
+              removed.discard("")
+
+              def fix(ref):
+                  ref = remap.get(ref, ref)
+                  return ref if ref not in removed else None
+
+              if isinstance(bom.get("dependencies"), list):
+                  deps, idx = [], {}
+                  for d in bom["dependencies"]:
+                      if not isinstance(d, dict):
+                          continue
+                      r = fix(d.get("ref"))
+                      if r is None or (r not in kept_refs and d.get("ref") in remap):
+                          continue
+                      on = [x for x in (fix(x) for x in d.get("dependsOn") or []) if x and x != r]
+                      if r in idx:  # merge entries of collapsed duplicates
+                          tgt = idx[r]
+                          tgt["dependsOn"] = sorted(set(tgt.get("dependsOn", [])) | set(on))
+                          continue
+                      nd = dict(d, ref=r)
+                      if "dependsOn" in d or on:
+                          nd["dependsOn"] = list(dict.fromkeys(on))
+                      idx[r] = nd
+                      deps.append(nd)
+                  bom["dependencies"] = deps
+              for v in bom.get("vulnerabilities") or []:
+                  if isinstance(v, dict) and isinstance(v.get("affects"), list):
+                      aff = []
+                      for a in v["affects"]:
+                          r = fix(a.get("ref")) if isinstance(a, dict) else None
+                          if r and r not in {x["ref"] for x in aff}:
+                              aff.append(dict(a, ref=r))
+                      if aff:
+                          v["affects"] = aff
+                      else:  # every affected component was suppressed: keep the finding, drop dangling refs
+                          v.pop("affects")
+              return bom, suppressed
+          CYTEX_AIBOM_REFINE_PY_EOF
+          cat > /tmp/cytex-tools/gitleaks_aibom.py <<'CYTEX_GITLEAKS_AIBOM_PY_EOF'
+          """Convert gitleaks JSON findings into cisco-aibom style CycloneDX components.
+
+          Never copies Secret / Match / Fingerprint values into the output.
+          """
+          import hashlib
+          import re
+
+          # (pattern searched in rule id / variable name, provider, ai_related)
+          _PROVIDERS = [
+              (r"openrouter", "OpenRouter", True),
+              (r"openai", "OpenAI", True),
+              (r"anthropic|claude", "Anthropic", True),
+              (r"groq", "Groq", True),
+              (r"nvidia|nvapi|\bnim\b", "NVIDIA", True),
+              (r"hugging|\bhf_|^hf$", "HuggingFace", True),
+              (r"gemini|google_ai|genai|palm", "Google Gemini", True),
+              (r"vertex", "Google Vertex AI", True),
+              (r"cohere", "Cohere", True),
+              (r"mistral", "Mistral", True),
+              (r"perplexity|pplx", "Perplexity", True),
+              (r"replicate", "Replicate", True),
+              (r"together", "Together AI", True),
+              (r"deepseek", "DeepSeek", True),
+              (r"fireworks", "Fireworks AI", True),
+              (r"\bxai\b|grok", "xAI", True),
+              (r"ollama", "Ollama", True),
+              (r"langsmith|langchain", "LangSmith", True),
+              (r"pinecone", "Pinecone", True),
+              (r"weaviate", "Weaviate", True),
+              (r"qdrant", "Qdrant", True),
+              (r"tavily", "Tavily", True),
+              (r"elevenlabs|eleven_labs", "ElevenLabs", True),
+              (r"stability", "Stability AI", True),
+              (r"voyage", "Voyage AI", True),
+              (r"azure_openai|aoai", "Azure OpenAI", True),
+              (r"\bwandb\b|weights_and_biases", "Weights & Biases", True),
+              (r"\bllm\b", "LLM (unspecified)", True),
+              # non-AI, still useful to label
+              (r"github", "GitHub", False),
+              (r"gitlab", "GitLab", False),
+              (r"\baws\b|amazon", "AWS", False),
+              (r"\bgcp\b", "Google Cloud", False),
+              (r"azure", "Azure", False),
+              (r"slack", "Slack", False),
+              (r"stripe", "Stripe", False),
+              (r"\bnvd\b", "NIST NVD", False),
+              (r"\botx\b|alienvault", "AlienVault OTX", False),
+              (r"wasabi", "Wasabi", False),
+              (r"mongo", "MongoDB", False),
+              (r"postgres|\bpg\b", "PostgreSQL", False),
+          ]
+          _PROVIDERS = [(re.compile(p, re.I), name, ai) for p, name, ai in _PROVIDERS]
+
+          # Generic rules whose findings are dropped when a provider-specific rule hit the same file+line.
+          _GENERIC_RULES = {"generic-api-key", "env-api-key-assignment"}
+
+          # Variable name at the start of a (redacted) Match, e.g. `# OPENAI_API_KEY="REDACTED"`.
+          _VAR_RE = re.compile(r"""^[\s#/*;-]*(?:export\s+)?["']?([A-Za-z_][A-Za-z0-9_.-]{1,80}?)["']?\s*(?::=|=|:)""")
+
+
+          def _var_name(match):
+              """Return the assigned variable name from a gitleaks Match, or None. Only the name is kept."""
+              if not isinstance(match, str):
+                  return None
+              m = _VAR_RE.match(match)
+              if not m:
+                  return None
+              name = m.group(1)
+              # A real identifier: has a letter and no long random-looking run (defensive: never echo a secret).
+              if not re.search(r"[A-Za-z]", name) or re.search(r"[A-Za-z0-9]{40,}", name):
+                  return None
+              return name
+
+
+          def _lookup(text):
+              if not text:
+                  return None
+              # Normalise separators so \b-anchored patterns work on SNAKE_CASE / kebab-case.
+              norm = re.sub(r"[_\-.]+", " ", text)
+              for rx, provider, ai in _PROVIDERS:
+                  if rx.search(norm) or rx.search(text):
+                      return provider, ai
+              return None
+
+
+          def _classify(rule_id, var_name):
+              """Pick provider/AI flag.
+
+              - generic rules: the variable name decides (GROQ_API_KEY -> Groq), rule id as fallback.
+              - key-format rules: the rule decides (groq-api-key on LLM_API_KEY -> Groq), unless the rule
+                is non-AI and the variable is AI (gcp-api-key on GEMINI_API_KEY -> Google Gemini).
+              """
+              by_rule, by_var = _lookup(rule_id), _lookup(var_name)
+              if rule_id in _GENERIC_RULES:
+                  order = (by_var, by_rule)
+              elif by_rule and by_rule[1]:
+                  order = (by_rule, by_var)
+              else:
+                  order = (by_var, by_rule) if (by_var and by_var[1]) else (by_rule, by_var)
+              for hit in order:
+                  if hit:
+                      return hit
+              return "unknown", False
+
+
+          def gitleaks_components(findings, ai_only=False):
+              """Turn gitleaks JSON findings (list of dicts) into CycloneDX `data` components.
+
+              Dedupes by (file, line, rule); additionally drops generic-rule hits on a line that a
+              provider-specific rule already reported. Secret/Match values are never emitted.
+              """
+              if not isinstance(findings, list):
+                  return []
+
+              rows = {}
+              for f in findings:
+                  if not isinstance(f, dict) or not (f.get("File") or f.get("RuleID")):
+                      continue
+                  rule = str(f.get("RuleID") or "unknown-rule")
+                  path = str(f.get("File") or "")
+                  line = f.get("StartLine")
+                  key = (path, line, rule)
+                  if key in rows:
+                      continue
+                  rows[key] = (rule, path, line, _var_name(f.get("Match")))
+
+              specific_lines = {(p, l) for (p, l, r) in rows if r not in _GENERIC_RULES}
+              # Provider-specific rules match only the key itself; borrow the variable name that a
+              # generic/env rule captured on the same line (e.g. groq-api-key on `GROQ_API_KEY=...`).
+              line_names = {}
+              for (p, l, _r), (_, _, _, v) in rows.items():
+                  if v:
+                      line_names.setdefault((p, l), v)
+              seen_name_line = set()
+              components = []
+              for (path, line, rule), (_, _, _, var) in sorted(rows.items(), key=lambda kv: (kv[0][0], kv[0][1] or 0, kv[0][2])):
+                  var = var or line_names.get((path, line))
+                  if rule in _GENERIC_RULES and (path, line) in specific_lines:
+                      continue
+                  if rule in _GENERIC_RULES:  # generic-api-key and env rule on the same line -> keep one
+                      if (path, line) in seen_name_line:
+                          continue
+                      seen_name_line.add((path, line))
+
+                  provider, ai = _classify(rule, var)
+                  if ai_only and not ai:
+                      continue
+
+                  name = var or rule
+                  ref_src = "gitleaks|%s|%s|%s" % (path, line, rule)
+                  components.append({
+                      "type": "data",
+                      "bom-ref": "secret:gitleaks:" + hashlib.sha256(ref_src.encode()).hexdigest()[:16],
+                      "name": name,
+                      "_source": "gitleaks",
+                      "properties": [
+                          {"name": "cisco-aibom:type", "value": "secret"},
+                          {"name": "cisco-aibom:file", "value": path},
+                          {"name": "cisco-aibom:line", "value": "" if line is None else str(line)},
+                          {"name": "secret:RuleID", "value": rule},
+                          {"name": "secret:Provider", "value": provider},
+                          {"name": "secret:AIRelated", "value": "true" if ai else "false"},
+                      ],
+                  })
+              return components
+          CYTEX_GITLEAKS_AIBOM_PY_EOF
+          cat > /tmp/cytex-tools/gitleaks-ai.toml <<'CYTEX_GITLEAKS_AI_TOML_EOF'
+          title = "gitleaks default + AI provider keys"
+
+          [extend]
+          useDefault = true
+
+          [[rules]]
+          id = "groq-api-key"
+          description = "Groq API key"
+          regex = '''\b(gsk_[A-Za-z0-9]{52})\b'''
+          entropy = 3
+          keywords = ["gsk_"]
+
+          [[rules]]
+          id = "nvidia-api-key"
+          description = "NVIDIA NIM / build.nvidia.com API key"
+          regex = '''\b(nvapi-[A-Za-z0-9_-]{64})(?:[^A-Za-z0-9_-]|$)'''
+          entropy = 3
+          keywords = ["nvapi-"]
+
+          [[rules]]
+          id = "replicate-api-token"
+          description = "Replicate API token"
+          regex = '''\b(r8_[A-Za-z0-9]{37})\b'''
+          entropy = 3
+          keywords = ["r8_"]
+
+          [[rules]]
+          id = "xai-api-key"
+          description = "xAI (Grok) API key"
+          regex = '''\b(xai-[A-Za-z0-9]{80})\b'''
+          entropy = 3
+          keywords = ["xai-"]
+
+          [[rules]]
+          id = "openrouter-api-key"
+          description = "OpenRouter API key"
+          regex = '''\b(sk-or-v1-[a-f0-9]{64})\b'''
+          entropy = 3
+          keywords = ["sk-or-v1-"]
+
+          [[rules]]
+          id = "langsmith-api-key"
+          description = "LangSmith API key"
+          regex = '''\b(lsv2_(?:pt|sk)_[a-f0-9]{32}_[a-f0-9]{10})\b'''
+          entropy = 3
+          keywords = ["lsv2_"]
+
+          # NAME_API_KEY=value / NAME_TOKEN: "value" / export NAME_SECRET='value'
+          # (also matches commented-out lines). Group 1 = variable name, group 2 = secret.
+          [[rules]]
+          id = "env-api-key-assignment"
+          description = "Credential assigned to an *_API_KEY / *_TOKEN / *_SECRET style variable"
+          regex = '''\b([A-Z][A-Z0-9_]*(?:API_KEY|APIKEY|_TOKEN|_SECRET|SECRET_KEY|ACCESS_KEY|_PAT))\b["']?[ \t]*[:=][ \t]*["']?([A-Za-z0-9_\-.+/=~]{16,})'''
+          secretGroup = 2
+          entropy = 3
+          keywords = ["api_key", "apikey", "_token", "_secret", "secret_key", "access_key", "_pat"]
+            [[rules.allowlists]]
+            regexTarget = "secret"
+            regexes = [
+              '''(?i)^(?:your|my|xxx|changeme|change_me|replace|example|dummy|sample|placeholder|insert|enter|none|null|redacted)''',
+              '''(?i)^(?:os\.|process\.env|env\.|settings\.|config\.|self\.|request\.)''',
+              '''^[x*.\-_]+$''',
+            ]
+          CYTEX_GITLEAKS_AI_TOML_EOF
       - name: Resolve scan scope
         env:
           CHANGED_FILES: ${{ github.event.inputs.changedFiles }}
@@ -98,6 +1370,9 @@ jobs:
           semgrep --config=auto "$SCAN_DIR" --json | tee "$REPORT_DIR/semgrep.json"
           echo "SEMGREP_STATUS=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
 
+      # Always analyzes the whole checkout: an incremental copy of only the changed files hides
+      # the imports, manifests and .env that classification needs. The consolidate step
+      # then keeps only components located in the changed files.
       # timeout bounds the enrichment pass; console output (incl. compliance) is teed for the report.
       - name: Generate AIBOM (Cisco AIBOM)
         env:
@@ -106,24 +1381,29 @@ jobs:
           set +e
           if [ -z "$AIBOM_LLM_API_KEY" ]; then
             echo "No GROQ_API_KEY secret -- rule-based AIBOM only (the LLM points at a dead local address, so no code leaves the runner)"
-            timeout 600 cisco-aibom analyze "$SCAN_DIR" \
+            timeout 1200 cisco-aibom analyze . \
               -o cyclonedx -O "$REPORT_DIR/aibom.cdx.json" \
               --llm-model "$AIBOM_LLM_MODEL" \
               --llm-provider openai \
               --llm-api-base http://127.0.0.1:9/v1 \
               --llm-api-key no-key \
+              --agentic-review-secrets \
+              --agentic-max-consecutive-failures 1 \
+              --agentic-max-retry-seconds 0 \
               --severity info \
               --compliance all \
               --timing \
               --validate \
               --show-summary 2>&1 | tee "$REPORT_DIR/aibom_console.txt"
           else
-            timeout 600 cisco-aibom analyze "$SCAN_DIR" \
+            timeout 1200 cisco-aibom analyze . \
               -o cyclonedx -O "$REPORT_DIR/aibom.cdx.json" \
               --llm-model "$AIBOM_LLM_MODEL" \
               --llm-provider "$AIBOM_LLM_PROVIDER" \
               --llm-api-key "$AIBOM_LLM_API_KEY" \
+              --llm-api-base "$AIBOM_LLM_API_BASE" \
               --agentic-fast-model "$AIBOM_FAST_MODEL" \
+              --agentic-review-secrets \
               --severity info \
               --agentic-batch-size 3 \
               --agentic-concurrency 1 \
@@ -163,6 +1443,19 @@ jobs:
             echo "MCP_STATUS=skipped" >> "$GITHUB_ENV"
           fi
 
+      # Rule-based secret scan (values redacted); AI-provider keys are tagged in the report.
+      - name: Scan for secrets (gitleaks)
+        run: |
+          set +e
+          if command -v gitleaks >/dev/null; then
+            (cd "$SCAN_DIR" && gitleaks dir . --config /tmp/cytex-tools/gitleaks-ai.toml --redact --no-banner \
+              --log-level warn --exit-code 0 --max-target-megabytes 5 --report-format json \
+              --report-path "$REPORT_DIR/gitleaks.json")
+            echo "GITLEAKS_STATUS=$?" >> "$GITHUB_ENV"
+          else
+            echo "GITLEAKS_STATUS=not_installed" >> "$GITHUB_ENV"
+          fi
+
       # Merge all scanner outputs into one CycloneDX report; each item tagged with its _source.
       - name: Consolidate scan report
         if: always()
@@ -173,6 +1466,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           EVENT_NAME: ${{ github.event_name }}
+          CHANGED_FILES: ${{ github.event.inputs.changedFiles }}
         run: |
           mkdir -p "$REPORT_DIR"
           export SCAN_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -181,7 +1475,9 @@ jobs:
           python3 - <<'PYEOF'
           import json
           import os
+          import sys
 
+          sys.path.insert(0, "/tmp/cytex-tools")
           report_dir = os.environ["REPORT_DIR"]
 
           def load(name):
@@ -198,6 +1494,20 @@ jobs:
           aibom = load("aibom.cdx.json")
           grype = load("grype.cdx.json")
           semgrep = load("semgrep.json")
+
+          # No-LLM precision pass: drop data classes reported as agents, non-AI env endpoints
+          # and duplicates (each listed in cytexScan.suppressed with a reason), and on
+          # incremental scans keep only components in the changed files.
+          suppressed = []
+          if aibom:
+              try:
+                  from aibom_refine import refine_aibom
+                  changed = None
+                  if os.environ.get("SCAN_TYPE") == "incremental":
+                      changed = [p for p in os.environ.get("CHANGED_FILES", "").split(",") if p]
+                  aibom, suppressed = refine_aibom(aibom, repo_root=os.getcwd(), changed_files=changed)
+              except Exception as error:
+                  print("AIBOM refine skipped: %s: %s" % (type(error).__name__, error))
 
           # Make file references repo-relative by stripping absolute runner paths.
           prefixes = sorted(
@@ -284,6 +1594,17 @@ jobs:
                         "_source": "skills",
                     })
 
+          # Secrets -> components[] (_source "gitleaks"), values never included.
+          secret_count = 0
+          try:
+              from gitleaks_aibom import gitleaks_components
+              leaks = load("gitleaks.json")
+              secrets = gitleaks_components(leaks if isinstance(leaks, list) else [])
+              combined.setdefault("components", []).extend(secrets)
+              secret_count = len(secrets)
+          except Exception as error:
+              print("gitleaks merge skipped: %s: %s" % (type(error).__name__, error))
+
           # MCP findings -> vulnerabilities[] (_source "mcp"). mcp-scanner's raw shape isn't
           # fixed, so locate findings defensively and keep the whole finding in a property.
           mcp_doc = load("mcp.json")
@@ -360,7 +1681,9 @@ jobs:
                   "aibom": os.environ.get("AIBOM_STATUS", ""),
                   "skills": os.environ.get("SKILLS_STATUS", ""),
                   "mcp": os.environ.get("MCP_STATUS", ""),
+                  "gitleaks": os.environ.get("GITLEAKS_STATUS", ""),
               },
+              "suppressed": suppressed,
               "summary": {
                   "components": len(combined.get("components") or []),
                   "skillComponents": len([c for c in combined.get("components") or []
@@ -369,6 +1692,8 @@ jobs:
                                         if isinstance(v, dict) and v.get("_source") == "skills"]),
                   "mcpFindings": len([v for v in combined.get("vulnerabilities") or []
                                       if isinstance(v, dict) and v.get("_source") == "mcp"]),
+                  "secrets": secret_count,
+                  "suppressedComponents": len(suppressed),
                   "dependencies": len(combined.get("dependencies") or []),
                   "vulnerabilities": len(combined.get("vulnerabilities") or []),
                   "sastFindings": len(findings),
@@ -381,7 +1706,7 @@ jobs:
               "artifacts": {
                   "report": "cytex-scan-report.json",
                   "sources": ["sbom.cdx.json", "aibom.cdx.json", "aibom_console.txt", "grype.cdx.json",
-                              "semgrep.json", "skills.json", "mcp.json"],
+                              "semgrep.json", "skills.json", "mcp.json", "gitleaks.json"],
               },
           }
 
