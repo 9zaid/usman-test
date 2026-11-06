@@ -23,14 +23,10 @@ jobs:
       # 1.10.0 finds the most without an LLM (benchmarked against rc2, 1.0.9 and 1.10.1).
       AIBOM_VERSION: 1.10.0
       AIBOM_CATALOG_SHA256: b1165384a646094aa6a4762d676f285c1c68b6d7f9367c90a129b529904a3268
-      # Groq through its OpenAI-compatible endpoint: langchain-groq sends JSON mode together
-      # with tool calling, which Groq rejects (400), so every LLM batch failed. cisco-aibom
-      # strips a leading "openai/" when the provider is openai, hence the doubled prefix:
-      # Groq receives "openai/gpt-oss-120b".
-      AIBOM_LLM_PROVIDER: openai
+      # The LLM is always Groq, via its OpenAI-compatible endpoint (langchain-groq sends JSON
+      # mode together with tool calling, which Groq rejects). Key and model come from the
+      # customer's GROQ_API_KEY / GROQ_MODEL secrets; without both the scan is rule-based.
       AIBOM_LLM_API_BASE: https://api.groq.com/openai/v1
-      AIBOM_LLM_MODEL: openai/openai/gpt-oss-120b
-      AIBOM_FAST_MODEL: openai/openai/gpt-oss-20b
       GRYPE_VERSION: v0.112.0
       SYFT_VERSION: v1.50.0
       SEMGREP_VERSION: 1.182.1
@@ -3765,6 +3761,24 @@ jobs:
                   return None
 
 
+          DOCUMENT_EXT = (".xlsx", ".xls", ".docx", ".doc", ".pptx", ".pdf", ".zip", ".jar", ".gz", ".tar", ".png", ".jpg")
+
+
+          def _rate_secrets(components):
+              """Unverified secrets get a confidence: two detectors agreeing -> high, one -> medium, one
+              detector inside a document/archive (decoded binary content, pattern-only) -> low."""
+              for comp in components:
+                  if comp.get("_source") not in ("gitleaks", "trufflehog"):
+                      continue
+                  props = {p.get("name"): p.get("value") for p in comp.get("properties") or []}
+                  if "cytex:confidence" in props:
+                      continue
+                  both = bool(props.get("secret:AlsoDetectedBy"))
+                  in_doc = str(props.get("cisco-aibom:file") or "").lower().endswith(DOCUMENT_EXT)
+                  level = "high" if both else ("low" if in_doc else "medium")
+                  comp.setdefault("properties", []).append({"name": "cytex:confidence", "value": level})
+
+
           def merge_extra(combined, report_dir, semgrep_doc, scan_dir):
               """Add semgrep-AI, TruffleHog and ModelScan results to `combined` in place.
               Returns (tool statuses, counts) for cytexScan."""
@@ -3803,6 +3817,7 @@ jobs:
               except Exception as error:
                   print("modelscan merge skipped: %s: %s" % (type(error).__name__, error))
 
+              _rate_secrets(components)
               tools = {"semgrepAi": "0" if "semgrepAiComponents" in counts else "",
                        "trufflehog": str(status.get("trufflehog", "")), "modelscan": str(status.get("modelscan", ""))}
               return tools, counts
@@ -3939,18 +3954,21 @@ jobs:
       # timeout bounds the enrichment pass; console output (incl. compliance) is teed for the report.
       - name: Generate AIBOM (Cisco AIBOM)
         env:
-          AIBOM_LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: ${{ secrets.GROQ_MODEL || vars.GROQ_MODEL }}
         run: |
           set +e
           # Whole checkout minus documents/media/archives (cisco-aibom has no exclude option
           # and its secret detector otherwise spends minutes in PDFs); big model weights stay
           # as empty placeholders so they are still detected by name.
           python3 /tmp/cytex-tools/prepare_src.py . "$AIBOM_SRC"
-          if [ -z "$AIBOM_LLM_API_KEY" ]; then
-            echo "No GROQ_API_KEY secret -- rule-based AIBOM only (the LLM points at a dead local address, so no code leaves the runner)"
+          if [ -z "$GROQ_API_KEY" ] || [ -z "$GROQ_MODEL" ]; then
+            # cisco-aibom requires a model name; it points at a dead local address, so the LLM
+            # step fails fast and nothing leaves the runner.
+            echo "GROQ_API_KEY and GROQ_MODEL not both configured -- rule-based AIBOM only (no LLM)"
             timeout 1200 cisco-aibom analyze "$AIBOM_SRC" \
               -o cyclonedx -O "$REPORT_DIR/aibom.cdx.json" \
-              --llm-model "$AIBOM_LLM_MODEL" \
+              --llm-model openai/no-llm \
               --llm-provider openai \
               --llm-api-base http://127.0.0.1:9/v1 \
               --llm-api-key no-key \
@@ -3963,13 +3981,15 @@ jobs:
               --validate \
               --show-summary 2>&1 | tee "$REPORT_DIR/aibom_console.txt"
           else
+            # The "openai/" prefix is stripped by cisco-aibom, so Groq receives GROQ_MODEL as is.
+            echo "Groq LLM enrichment with model $GROQ_MODEL"
             timeout 1200 cisco-aibom analyze "$AIBOM_SRC" \
               -o cyclonedx -O "$REPORT_DIR/aibom.cdx.json" \
-              --llm-model "$AIBOM_LLM_MODEL" \
-              --llm-provider "$AIBOM_LLM_PROVIDER" \
-              --llm-api-key "$AIBOM_LLM_API_KEY" \
+              --llm-model "openai/$GROQ_MODEL" \
+              --llm-provider openai \
+              --llm-api-key "$GROQ_API_KEY" \
               --llm-api-base "$AIBOM_LLM_API_BASE" \
-              --agentic-fast-model "$AIBOM_FAST_MODEL" \
+              --agentic-fast-model "openai/$GROQ_MODEL" \
               --agentic-review-secrets \
               --severity info \
               --agentic-batch-size 3 \
