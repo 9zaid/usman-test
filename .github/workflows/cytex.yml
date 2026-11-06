@@ -991,6 +991,25 @@ jobs:
                           _set_prop(c, P_EVID, ev[:300])
                   stage3.append((c, rel))
 
+              # Datasets: 1.10.x reports every CSV/JSON data file. Without any AI/ML component in the
+              # repo they are just data (reports, exports, tutorials), so suppress them; otherwise
+              # keep them as low confidence, since nothing links them to training or inference.
+              def _is_dataset(c: dict) -> bool:
+                  return _ctype(c).lower() in ("data", "dataset") and c.get("_source") != "gitleaks"
+              has_ai = any(not _is_dataset(c) for c, _ in stage3)
+              kept3: list[tuple[dict, str | None]] = []
+              for c, rel in stage3:
+                  if _is_dataset(c):
+                      if not has_ai:
+                          removed.add(c.get("bom-ref") or "")
+                          record(c, rel, "false-positive: data file in a repo with no AI/ML components")
+                          continue
+                      if not _prop(c, P_CONF):
+                          _set_prop(c, P_CONF, "low")
+                          _set_prop(c, P_EVID, "data file in a repo with AI/ML components; no training/inference link found")
+                  kept3.append((c, rel))
+              stage3 = kept3
+
               # ---- 4. incremental scope
               if changed_files is not None:
                   changed = {paths.rel(f) or f for f in changed_files if f}
@@ -1329,6 +1348,9 @@ jobs:
           CHANGED_FILES: ${{ github.event.inputs.changedFiles }}
         run: |
           mkdir -p "$REPORT_DIR"
+          # Our own workflow file is not the customer's code: every scanner flagged it (curl
+          # installs, AI pipeline steps). The run has already loaded it, so drop it here.
+          rm -f .github/workflows/cytex.yml
           SCAN_TYPE=full
           SCAN_DIR=.
           CHANGED_FILE_COUNT=0
