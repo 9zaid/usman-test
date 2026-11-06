@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REPORT_DIR: /tmp/cytex-reports
+      AIBOM_SRC: /tmp/cytex-aibom-src
       # 1.10.0 finds the most without an LLM (benchmarked against rc2, 1.0.9 and 1.10.1).
       AIBOM_VERSION: 1.10.0
       AIBOM_CATALOG_SHA256: b1165384a646094aa6a4762d676f285c1c68b6d7f9367c90a129b529904a3268
@@ -32,36 +33,45 @@ jobs:
       AIBOM_FAST_MODEL: openai/openai/gpt-oss-20b
       GRYPE_VERSION: v0.112.0
       SYFT_VERSION: v1.50.0
+      SEMGREP_VERSION: 1.182.1
+      MCP_SCANNER_VERSION: 4.8.7
       GITLEAKS_VERSION: 8.30.1
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           persist-credentials: false
 
       # cisco-aibom needs Python >=3.11,<3.14; pin it instead of trusting the runner image
       # (ubuntu-latest moved to 26.04 with Python 3.14, where pip finds no cisco-aibom).
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
+
+      # cisco-aibom[all] is a large install; reuse the pip download cache between runs.
+      - name: Cache pip downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.cache/pip
+          key: cytex-pip-${{ runner.os }}-py312-aibom-${{ env.AIBOM_VERSION }}-semgrep-${{ env.SEMGREP_VERSION }}-mcp-${{ env.MCP_SCANNER_VERSION }}
 
       - name: Install scan toolchain
         run: |
           for i in 1 2 3 4 5; do curl -sSfL --retry 3 --retry-delay 5 -o /tmp/grype-install.sh https://raw.githubusercontent.com/anchore/grype/$GRYPE_VERSION/install.sh && sh /tmp/grype-install.sh -b /usr/local/bin $GRYPE_VERSION && break; echo "grype install failed (attempt $i/5)"; sleep $((i * 15)); done
           for i in 1 2 3 4 5; do curl -sSfL --retry 3 --retry-delay 5 -o /tmp/syft-install.sh https://raw.githubusercontent.com/anchore/syft/$SYFT_VERSION/install.sh && sh /tmp/syft-install.sh -b /usr/local/bin $SYFT_VERSION && break; echo "syft install failed (attempt $i/5)"; sleep $((i * 15)); done
           # cisco-aibom[all] also installs skill-scanner (via its "security" extra).
-          python3 -m pip install --quiet --pre "cisco-aibom[all]==$AIBOM_VERSION" langchain-groq
+          python3 -m pip install --quiet --pre "cisco-aibom[all]==$AIBOM_VERSION"
           # semgrep and mcp-scanner run from isolated pipx environments.
-          pipx install --force semgrep
-          pipx install --force cisco-ai-mcp-scanner
+          pipx install --force "semgrep==$SEMGREP_VERSION"
+          pipx install --force "cisco-ai-mcp-scanner==$MCP_SCANNER_VERSION"
           mkdir -p ~/.aibom/catalogs
           curl -sSfL --retry 5 --retry-delay 10 -o ~/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb https://github.com/cisco-ai-defense/aibom/releases/download/$AIBOM_VERSION/aibom_catalog-$AIBOM_VERSION.duckdb
           echo "$AIBOM_CATALOG_SHA256  $HOME/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb" | sha256sum -c -
           for i in 1 2 3 4 5; do curl -sSfL --retry 3 --retry-delay 5 -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz && echo "$GITLEAKS_SHA256  /tmp/gitleaks.tar.gz" | sha256sum -c - && tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks && break; echo "gitleaks install failed (attempt $i/5)"; sleep $((i * 15)); done
 
-      # Helpers for the consolidate step (generated from scripts/github/*.py and *.toml).
+      # Helpers run on the runner (generated from aibom/devops/aibom_helpers).
       - name: Prepare Cytex helpers
         run: |
           mkdir -p /tmp/cytex-tools
@@ -1278,6 +1288,210 @@ jobs:
                   })
               return components
           CYTEX_GITLEAKS_AIBOM_PY_EOF
+          cat > /tmp/cytex-tools/report_extras.py <<'CYTEX_REPORT_EXTRAS_PY_EOF'
+          """Final touches on the consolidated scan report.
+
+          * dedupe_secrets: cisco-aibom reports secrets as vulnerabilities[], gitleaks as components[];
+            drop the cisco-aibom finding when gitleaks found the same file:line, so nothing is counted
+            twice.
+          * strict_bom / validate: the platform report carries extra top-level keys (semgrep,
+            compliance, cytexScan) and per-item `_source`, which strict CycloneDX rejects. strict_bom
+            derives a schema-valid copy (extras folded into properties) for third-party tools.
+          """
+          import copy
+          import json
+          import os
+
+          ROOT_KEYS = {"$schema", "bomFormat", "specVersion", "serialNumber", "version", "metadata",
+                       "components", "services", "externalReferences", "dependencies", "compositions",
+                       "properties", "vulnerabilities", "annotations", "formulation", "declarations",
+                       "definitions", "signature"}
+          COMPONENT_TYPES = {"application", "framework", "library", "container", "platform",
+                             "operating-system", "device", "device-driver", "firmware", "file",
+                             "machine-learning-model", "data", "cryptographic-asset"}
+
+
+          def _props(item):
+              return {p.get("name"): p.get("value") for p in item.get("properties") or [] if isinstance(p, dict)}
+
+
+          def _rel(path, prefixes):
+              path = str(path or "")
+              for prefix in prefixes:
+                  if prefix and path.startswith(prefix):
+                      return path[len(prefix):]
+              return path[2:] if path.startswith("./") else path
+
+
+          def dedupe_secrets(combined, suppressed, prefixes=()):
+              """Drop cisco-aibom secret findings that gitleaks also reported; returns the secret count."""
+              prefixes = sorted({p.rstrip("/") + "/" for p in prefixes if p and p != "/"}, key=len, reverse=True)
+              leaks = [c for c in combined.get("components") or [] if c.get("_source") == "gitleaks"]
+              seen = {(_rel(_props(c).get("cisco-aibom:file"), prefixes), str(_props(c).get("cisco-aibom:line")))
+                      for c in leaks}
+              kept, aibom_secrets = [], 0
+              for vuln in combined.get("vulnerabilities") or []:
+                  props = _props(vuln)
+                  if props.get("cisco-aibom:type") != "secret":
+                      kept.append(vuln)
+                      continue
+                  rel = _rel(props.get("cytex:file") or props.get("cisco-aibom:file"), prefixes)
+                  line = str(props.get("cisco-aibom:line"))
+                  if (rel, line) in seen:
+                      name = str(vuln.get("id") or "secret").split("_/")[0]
+                      suppressed.append({"name": name, "type": "secret", "file": rel, "line": line,
+                                         "reason": "duplicate: same secret also found by gitleaks (kept as a component)"})
+                      continue
+                  aibom_secrets += 1
+                  kept.append(vuln)
+              if "vulnerabilities" in combined:
+                  combined["vulnerabilities"] = kept
+              return len(leaks) + aibom_secrets
+
+
+          def dedupe_exact(combined):
+              """Remove byte-identical repeats from components/vulnerabilities/dependencies (scanners
+              sometimes emit the same finding twice); returns how many were removed."""
+              removed = 0
+              for key in ("components", "vulnerabilities", "dependencies"):
+                  items, seen = [], set()
+                  for item in combined.get(key) or []:
+                      sig = json.dumps(item, sort_keys=True)
+                      if sig in seen:
+                          removed += 1
+                          continue
+                      seen.add(sig)
+                      items.append(item)
+                  if key in combined:
+                      combined[key] = items
+              return removed
+
+
+          def strict_bom(combined):
+              """Schema-valid CycloneDX copy: `_source` -> cytex:source property, unknown component types
+              -> application + cytex:type, extra top-level keys -> metadata properties (JSON text)."""
+              bom = copy.deepcopy(combined)
+              dedupe_exact(bom)
+              extras = {k: bom.pop(k) for k in list(bom) if k not in ROOT_KEYS}
+              for key in ("components", "vulnerabilities"):
+                  for item in bom.get(key) or []:
+                      source = item.pop("_source", None)
+                      if source:
+                          item.setdefault("properties", []).append({"name": "cytex:source", "value": str(source)})
+                      if key == "components" and item.get("type") not in COMPONENT_TYPES:
+                          item.setdefault("properties", []).append({"name": "cytex:type", "value": str(item.get("type"))})
+                          item["type"] = "application"
+              for dep in bom.get("dependencies") or []:
+                  dep.pop("_source", None)
+              meta = bom.setdefault("metadata", {})
+              # The merged tools list mixes syft's component-style entries with legacy {vendor, name}
+              # tools; 1.5+ only accepts one form, so emit the component form.
+              tools = meta.get("tools")
+              if isinstance(tools, list):
+                  components = []
+                  for tool in tools:
+                      if not isinstance(tool, dict):
+                          continue
+                      entry = {"type": tool.get("type") if tool.get("type") in COMPONENT_TYPES else "application",
+                               "name": str(tool.get("name") or "unknown")}
+                      if tool.get("version"):
+                          entry["version"] = str(tool["version"])
+                      if tool.get("vendor") or tool.get("author"):
+                          entry["publisher"] = str(tool.get("vendor") or tool.get("author"))
+                      components.append(entry)
+                  meta["tools"] = {"components": components}
+              for key, value in extras.items():
+                  meta.setdefault("properties", []).append({"name": f"cytex:{key}", "value": json.dumps(value)})
+              return bom
+
+
+          def validate(bom):
+              """(True/False, message) from a strict CycloneDX JSON schema check; (None, why) when the
+              validator library is not installed."""
+              try:
+                  from cyclonedx.schema import SchemaVersion
+                  from cyclonedx.validation.json import JsonStrictValidator
+              except Exception as error:  # cyclonedx-python-lib[json-validation] missing
+                  return None, f"validator unavailable: {type(error).__name__}"
+              version = str(bom.get("specVersion") or "1.6")
+              try:
+                  schema = SchemaVersion.from_version(version)
+                  error = JsonStrictValidator(schema).validate_str(json.dumps(bom))
+              except Exception as exc:
+                  return False, f"{type(exc).__name__}: {str(exc)[:300]}"
+              return (error is None), ("valid CycloneDX " + version) if error is None else str(error)[:500]
+
+
+          if __name__ == "__main__":
+              import sys
+              doc = json.load(open(sys.argv[1]))
+              print(validate(strict_bom(doc)))
+              print(os.path.basename(sys.argv[1]))
+          CYTEX_REPORT_EXTRAS_PY_EOF
+          cat > /tmp/cytex-tools/prepare_src.py <<'CYTEX_PREPARE_SRC_PY_EOF'
+          """Copy a checkout into a scan directory for cisco-aibom, leaving out what slows it down
+          without adding AI findings.
+
+          cisco-aibom has no exclude option, and its secret detector spends minutes reading PDFs and
+          other binaries. Copied: source, config and manifests. Skipped: VCS/vendor dirs, documents,
+          media, archives and other binaries. Model weights (by extension) over the size limit become
+          empty placeholders, so model files are still detected by name without being read.
+
+          usage: python3 prepare_src.py <src> <dest> [max_mb]
+          """
+          import os
+          import shutil
+          import sys
+
+          SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache",
+                       ".pytest_cache", ".next"}
+          SKIP_EXT = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".png", ".jpg", ".jpeg",
+                      ".gif", ".bmp", ".ico", ".svg", ".webp", ".tif", ".tiff", ".mp3", ".mp4", ".wav", ".mov",
+                      ".avi", ".mkv", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar",
+                      ".war", ".whl", ".egg", ".so", ".dll", ".dylib", ".exe", ".o", ".a", ".class", ".pyc",
+                      ".woff", ".woff2", ".ttf", ".otf", ".eot", ".log", ".min.js", ".map"}
+          MODEL_EXT = {".pt", ".pth", ".bin", ".onnx", ".safetensors", ".gguf", ".ggml", ".h5", ".keras",
+                       ".pb", ".tflite", ".ckpt", ".pkl", ".joblib", ".mlmodel", ".pickle", ".npz"}
+
+
+          def _ext(name):
+              lower = name.lower()
+              if lower.endswith(".min.js"):
+                  return ".min.js"
+              return os.path.splitext(lower)[1]
+
+
+          def prepare(src, dest, max_mb=5):
+              limit = max_mb * 1024 * 1024
+              copied = skipped = placeholders = 0
+              for root, dirs, files in os.walk(src):
+                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                  rel_root = os.path.relpath(root, src)
+                  out_root = os.path.join(dest, rel_root) if rel_root != "." else dest
+                  os.makedirs(out_root, exist_ok=True)
+                  for name in files:
+                      path = os.path.join(root, name)
+                      if os.path.islink(path) or not os.path.isfile(path):
+                          continue
+                      ext = _ext(name)
+                      size = os.path.getsize(path)
+                      target = os.path.join(out_root, name)
+                      if ext in MODEL_EXT and size > limit:
+                          open(target, "wb").close()
+                          placeholders += 1
+                      elif ext in SKIP_EXT or size > limit:
+                          skipped += 1
+                      else:
+                          shutil.copy2(path, target)
+                          copied += 1
+              return copied, skipped, placeholders
+
+
+          if __name__ == "__main__":
+              max_mb = int(sys.argv[3]) if len(sys.argv) > 3 else 5
+              c, s, p = prepare(sys.argv[1], sys.argv[2], max_mb)
+              print(f"AIBOM source: {c} file(s) copied, {s} skipped (binary/document/oversized), {p} model placeholder(s)")
+          CYTEX_PREPARE_SRC_PY_EOF
           cat > /tmp/cytex-tools/gitleaks-ai.toml <<'CYTEX_GITLEAKS_AI_TOML_EOF'
           title = "gitleaks default + AI provider keys"
 
@@ -1401,9 +1615,13 @@ jobs:
           AIBOM_LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           set +e
+          # Whole checkout minus documents/media/archives (cisco-aibom has no exclude option
+          # and its secret detector otherwise spends minutes in PDFs); big model weights stay
+          # as empty placeholders so they are still detected by name.
+          python3 /tmp/cytex-tools/prepare_src.py . "$AIBOM_SRC"
           if [ -z "$AIBOM_LLM_API_KEY" ]; then
             echo "No GROQ_API_KEY secret -- rule-based AIBOM only (the LLM points at a dead local address, so no code leaves the runner)"
-            timeout 1200 cisco-aibom analyze . \
+            timeout 1200 cisco-aibom analyze "$AIBOM_SRC" \
               -o cyclonedx -O "$REPORT_DIR/aibom.cdx.json" \
               --llm-model "$AIBOM_LLM_MODEL" \
               --llm-provider openai \
@@ -1418,7 +1636,7 @@ jobs:
               --validate \
               --show-summary 2>&1 | tee "$REPORT_DIR/aibom_console.txt"
           else
-            timeout 1200 cisco-aibom analyze . \
+            timeout 1200 cisco-aibom analyze "$AIBOM_SRC" \
               -o cyclonedx -O "$REPORT_DIR/aibom.cdx.json" \
               --llm-model "$AIBOM_LLM_MODEL" \
               --llm-provider "$AIBOM_LLM_PROVIDER" \
@@ -1533,7 +1751,7 @@ jobs:
 
           # Make file references repo-relative by stripping absolute runner paths.
           prefixes = sorted(
-              {p.rstrip("/") + "/" for p in (os.environ.get("SCAN_PREFIX", ""), os.environ.get("WORKSPACE", "")) if p and p != "/"},
+              {p.rstrip("/") + "/" for p in (os.environ.get("SCAN_PREFIX", ""), os.environ.get("WORKSPACE", ""), os.environ.get("AIBOM_SRC", "")) if p and p != "/"},
               key=len, reverse=True,
           )
 
@@ -1617,13 +1835,10 @@ jobs:
                     })
 
           # Secrets -> components[] (_source "gitleaks"), values never included.
-          secret_count = 0
           try:
               from gitleaks_aibom import gitleaks_components
               leaks = load("gitleaks.json")
-              secrets = gitleaks_components(leaks if isinstance(leaks, list) else [])
-              combined.setdefault("components", []).extend(secrets)
-              secret_count = len(secrets)
+              combined.setdefault("components", []).extend(gitleaks_components(leaks if isinstance(leaks, list) else []))
           except Exception as error:
               print("gitleaks merge skipped: %s: %s" % (type(error).__name__, error))
 
@@ -1650,6 +1865,11 @@ jobs:
                   "properties": [{"name": "mcp:Raw", "value": json.dumps(f)[:2000]}],
                   "_source": "mcp",
               })
+
+          # Exact repeats out; a secret found by both cisco-aibom and gitleaks counts once.
+          from report_extras import dedupe_exact, dedupe_secrets, strict_bom, validate
+          dedupe_exact(combined)
+          secret_count = dedupe_secrets(combined, suppressed, prefixes)
 
           # Compliance verdicts print to the console, so parse the tables from
           # aibom_console.txt. Rows look like:  eu-1 | Model transparency | pass | detail
@@ -1733,6 +1953,14 @@ jobs:
           }
 
           combined = norm(combined)
+          # Schema-valid copy for third-party CycloneDX tools; the platform only ingests .json
+          # artifacts, so the .cdx extension keeps it out of ingestion.
+          strict = strict_bom(combined)
+          valid, detail = validate(strict)
+          combined["cytexScan"]["strictCycloneDX"] = {"valid": valid, "detail": detail,
+                                                      "file": "cytex-scan-report.strict.cdx"}
+          with open(os.path.join(report_dir, "cytex-scan-report.strict.cdx"), "w") as fh:
+              json.dump(strict, fh, indent=2, sort_keys=True)
           with open(os.path.join(report_dir, "cytex-scan-report.json"), "w") as fh:
               json.dump(combined, fh, indent=2, sort_keys=True)
           print("Consolidated report: components=%d vulnerabilities=%d sast=%d" % (
@@ -1744,7 +1972,9 @@ jobs:
       # Upload only the consolidated report; intermediate files stay out of the artifact.
       - name: Upload consolidated report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: cytex-scan-report
-          path: ${{ env.REPORT_DIR }}/cytex-scan-report.json
+          path: |
+            ${{ env.REPORT_DIR }}/cytex-scan-report.json
+            ${{ env.REPORT_DIR }}/cytex-scan-report.strict.cdx
