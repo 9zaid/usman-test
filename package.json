@@ -1,0 +1,15 @@
+{
+  "name": "ai-scan-demo-web",
+  "version": "1.0.0",
+  "description": "Chat widget backend (test fixture for the Cytex AI-BOM scanner)",
+  "type": "module",
+  "main": "web/chat.js",
+  "dependencies": {
+    "openai": "4.20.0",
+    "express": "4.17.1",
+    "axios": "0.21.0",
+    "lodash": "4.17.15",
+    "jsonwebtoken": "8.5.1",
+    "minimist": "1.2.5"
+  }
+}
